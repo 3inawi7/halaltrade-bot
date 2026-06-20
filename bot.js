@@ -33,6 +33,162 @@ const MAX_DAILY_PICKS = 3;
 let todaysPicks = [];
 const alertsSentToday = new Set();
 
+// ── Paper trading log ───────────────────────────────────────
+// Records every pick made so we can check 3 trading days later
+// whether the target/stop would actually have hit. No real money.
+const fs = require('fs');
+const path = require('path');
+const LOG_FILE = path.join(__dirname, 'data', 'paper_trades.json');
+
+function loadLog() {
+  try {
+    if (fs.existsSync(LOG_FILE)) return JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'));
+  } catch (e) { console.error('loadLog error:', e.message); }
+  return [];
+}
+
+function saveLog(log) {
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+  } catch (e) { console.error('saveLog error:', e.message); }
+}
+
+function logPicks(picks) {
+  const log = loadLog();
+  const today = new Date().toISOString().slice(0, 10);
+  picks.forEach(p => {
+    log.push({
+      date: today,
+      ticker: p.ticker,
+      entryPrice: p.price,
+      entryLow: p.entryLow,
+      entryHigh: p.entryHigh,
+      target: p.target,
+      stop: p.stop,
+      rsi: p.rsi,
+      closed: false,
+      result: null
+    });
+  });
+  saveLog(log);
+}
+
+// Checks ALL still-open paper trades against current price.
+// Used both for the daily status update and the Friday closing report.
+async function evaluateOpenTrades() {
+  const log = loadLog();
+  const open = log.filter(t => !t.closed);
+  const results = [];
+
+  for (const trade of open) {
+    const day = await getPrevDay(trade.ticker);
+    if (!day) continue;
+
+    const currentPrice = day.price;
+    let outcome = 'OPEN ⏳';
+    if (currentPrice >= trade.target)      outcome = 'TARGET HIT ✅';
+    else if (currentPrice <= trade.stop)   outcome = 'STOP HIT 🛑';
+
+    const pctMove = (((currentPrice - trade.entryPrice) / trade.entryPrice) * 100);
+
+    results.push({ trade, currentPrice, outcome, pctMove });
+
+    // Auto-close trades that hit target or stop so they don't get re-reported forever
+    if (outcome !== 'OPEN ⏳') {
+      trade.closed = true;
+      trade.result = outcome;
+      trade.closedPrice = currentPrice;
+      trade.closedPct = pctMove;
+      trade.closedDate = new Date().toISOString().slice(0, 10);
+    }
+
+    await new Promise(r => setTimeout(r, 4000)); // rate limit safety
+  }
+
+  saveLog(log);
+  return results;
+}
+
+// Daily status update — sent every trading day, shows all open paper positions
+async function sendDailyPaperStatus() {
+  const results = await evaluateOpenTrades();
+  if (results.length === 0) return; // nothing open, skip silently
+
+  const lines = [`📋 <b>Paper Trade Status</b> — ${new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Dubai' })}`, ``];
+
+  results.forEach(r => {
+    lines.push(`<b>${r.trade.ticker}</b> (picked ${r.trade.date})`);
+    lines.push(`   Entry: $${r.trade.entryPrice} → Now: $${r.currentPrice.toFixed(2)} (${r.pctMove >= 0 ? '+' : ''}${r.pctMove.toFixed(1)}%)`);
+    lines.push(`   Status: <b>${r.outcome}</b>`);
+    lines.push(``);
+  });
+
+  lines.push(`<i>Paper trading — no real money involved. Tracking accuracy before going live.</i>`);
+  await sendTelegram(lines.join('\n'));
+  console.log(`[${new Date().toISOString()}] Daily paper status sent — ${results.length} open trades`);
+}
+
+// Friday closing report — full week summary of wins/losses/open
+async function sendFridayClosingReport() {
+  await evaluateOpenTrades(); // refresh prices and auto-close any that hit target/stop today
+  const log = loadLog();
+
+  const oneWeekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const thisWeek = log.filter(t => t.date >= oneWeekAgo);
+
+  if (thisWeek.length === 0) {
+    await sendTelegram(`📊 <b>Weekly Closing Report</b>\nNo picks logged this week.`);
+    return;
+  }
+
+  const wins   = thisWeek.filter(t => t.result === 'TARGET HIT ✅').length;
+  const losses = thisWeek.filter(t => t.result === 'STOP HIT 🛑').length;
+  const open   = thisWeek.filter(t => !t.closed).length;
+  const closedCount = wins + losses;
+  const winRate = closedCount > 0 ? ((wins / closedCount) * 100).toFixed(0) : 'N/A';
+
+  const lines = [
+    `🌙 <b>Weekly Closing Report — Paper Trading</b>`,
+    `📅 Week ending ${new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Dubai' })}`,
+    ``,
+    `<b>━━━ ALL PICKS THIS WEEK ━━━</b>`,
+    ``
+  ];
+
+  thisWeek.forEach(t => {
+    const finalPrice = t.closed ? t.closedPrice : null;
+    const pct = t.closed ? t.closedPct : null;
+    lines.push(`<b>${t.ticker}</b> (${t.date})`);
+    lines.push(`   Entry: $${t.entryPrice} | Target: $${t.target} | Stop: $${t.stop}`);
+    if (t.closed) {
+      lines.push(`   Closed: $${finalPrice.toFixed(2)} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) — <b>${t.result}</b>`);
+    } else {
+      lines.push(`   Status: <b>Still open ⏳</b>`);
+    }
+    lines.push(``);
+  });
+
+  lines.push(`<b>━━━ WEEK SUMMARY ━━━</b>`);
+  lines.push(`✅ Wins: ${wins}  |  🛑 Losses: ${losses}  |  ⏳ Still open: ${open}`);
+  lines.push(`📊 Win rate (closed trades): ${winRate}%`);
+  lines.push(``);
+
+  if (closedCount >= 3) {
+    if (parseFloat(winRate) >= 60) lines.push(`🟢 Solid week — logic performing reasonably.`);
+    else if (parseFloat(winRate) >= 40) lines.push(`🟡 Mixed week — keep observing before risking capital.`);
+    else lines.push(`🔴 Weak week — would NOT recommend going live yet on this data.`);
+  } else {
+    lines.push(`📊 Not enough closed trades yet for a reliable read. Keep paper trading.`);
+  }
+
+  lines.push(``);
+  lines.push(`<i>This is paper trading only — no real money. Use this track record to decide when (or if) to go live.</i>`);
+
+  await sendTelegram(lines.join('\n'));
+  console.log(`[${new Date().toISOString()}] Friday closing report sent`);
+}
+
 async function sendTelegram(message) {
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
   const res = await fetch(url, {
@@ -89,10 +245,16 @@ async function buildDailyRecommendations() {
   const candidates = [];
 
   for (const stock of HALAL_UNIVERSE) {
+    // Small delay between tickers to stay under Polygon's free-tier rate limit (5 req/min)
+    await new Promise(r => setTimeout(r, 4000));
+
     const day = await getPrevDay(stock.ticker);
     const rsi = await getRSI(stock.ticker);
     const vol = await getVolatility(stock.ticker);
-    if (!day || rsi === null) continue;
+    if (!day || rsi === null) {
+      console.log(`Skipped ${stock.ticker} — missing data (day:${!!day}, rsi:${rsi})`);
+      continue;
+    }
 
     const price = day.price;
     const entryLow  = +(price * (1 - vol * 0.5)).toFixed(2);
@@ -153,6 +315,8 @@ async function sendDailyBriefing() {
     await sendTelegram(`⚠️ <b>HalalTrade</b>\nCouldn't fetch live data today — check Polygon API key/limits. No picks generated for ${today}.`);
     return;
   }
+
+  logPicks(todaysPicks); // record for paper-trade tracking
 
   const lines = [
     `☽ <b>HalalTrade Daily Briefing</b>`,
@@ -281,6 +445,13 @@ async function sendEODSummary() {
   console.log(`[${new Date().toISOString()}] EOD summary sent`);
 }
 
+function isWeekend() {
+  // Get day-of-week in UAE time, then check what US market day that corresponds to.
+  // Simplify: check the US/Eastern day-of-week directly, since that's what matters for NYSE/NASDAQ.
+  const usDay = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short' });
+  return usDay === 'Sat' || usDay === 'Sun';
+}
+
 function getUAETime() {
   const now = new Date().toLocaleString('en-US', { timeZone: 'Asia/Dubai', hour: 'numeric', minute: 'numeric', hour12: false });
   const [h, m] = now.split(':').map(Number);
@@ -292,22 +463,98 @@ function isMarketHours() {
   return hour >= 17 || hour === 0;
 }
 
+function isFriday() {
+  // This fires at 12:45 AM UAE, right after the US market closes.
+  // At that moment in US/Eastern it's already past midnight into the
+  // next calendar day, so we check "yesterday" in US time to get the
+  // actual trading day that just closed.
+  const usDate = new Date(Date.now() - 6 * 3600000); // back up ~6h to land in the prior US trading day
+  const usDay = usDate.toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short' });
+  return usDay === 'Fri';
+}
+
+// ── Telegram command listener ───────────────────────────────
+// Lets you trigger any report on demand by messaging the bot,
+// instead of waiting for the scheduled times.
+let lastUpdateId = 0;
+
+async function pollTelegramCommands() {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=0`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.ok || !data.result?.length) return;
+
+    for (const update of data.result) {
+      lastUpdateId = update.update_id;
+      const text = update.message?.text?.trim().toLowerCase();
+      const fromChatId = String(update.message?.chat?.id || '');
+      if (!text || fromChatId !== String(CHAT_ID)) continue; // only respond to your own chat
+
+      console.log(`[${new Date().toISOString()}] Command received: ${text}`);
+
+      if (text === '/today' || text === '/picks') {
+        await sendTelegram('🔄 Generating today\'s picks now...');
+        await sendDailyBriefing();
+      } else if (text === '/status') {
+        await sendTelegram('🔄 Checking open paper trades...');
+        await sendDailyPaperStatus();
+      } else if (text === '/weekly' || text === '/friday') {
+        await sendTelegram('🔄 Building weekly closing report...');
+        await sendFridayClosingReport();
+      } else if (text === '/help' || text === '/start') {
+        await sendTelegram([
+          `🤖 <b>HalalTrade Bot Commands</b>`,
+          ``,
+          `/today — Get fresh picks right now`,
+          `/status — Check open paper trades`,
+          `/weekly — Full weekly closing report`,
+          `/help — Show this menu`,
+          ``,
+          `Scheduled automatically:`,
+          `📅 5:00 PM UAE — daily briefing`,
+          `📋 12:45 AM UAE — daily status (Mon–Thu)`,
+          `🌙 12:45 AM UAE Friday — weekly closing report`
+        ].join('\n'));
+      }
+    }
+  } catch (err) {
+    console.error('pollTelegramCommands error:', err.message);
+  }
+}
+
 async function mainLoop() {
   console.log('HalalTrade Bot v2 starting (dynamic daily picks)...');
+
+  // Skip any old/stale messages sent before this boot (e.g. your earlier
+  // chat-ID lookup test messages) so the bot doesn't reprocess them as commands.
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates`);
+    const data = await res.json();
+    if (data.ok && data.result?.length) {
+      lastUpdateId = data.result[data.result.length - 1].update_id;
+    }
+  } catch (e) { console.error('Initial update sync error:', e.message); }
 
   await sendTelegram([
     `🤖 <b>HalalTrade Bot is LIVE</b> (v2 — dynamic picks)`,
     ``,
     `📅 Daily briefing: 5:00 PM UAE — picks recalculated fresh from live data`,
     `⚡ Price alerts: every 5 min during market hours`,
-    `🌙 EOD summary: 12:30 AM UAE`,
+    `📋 Daily status: 12:45 AM UAE (Mon–Thu)`,
+    `🌙 Weekly closing report: 12:45 AM UAE Friday`,
     ``,
     `☽ Zero-tolerance halal · Strict mode`,
     `💰 Tracking: $${CAPITAL} capital`,
-    `🇦🇪 Timezone: Asia/Dubai (GST)`
+    `🇦🇪 Timezone: Asia/Dubai (GST)`,
+    ``,
+    `💬 Send /help anytime to trigger reports on demand`
   ].join('\n'));
 
   let lastMinute = -1;
+
+  // Poll for incoming Telegram commands every 3 seconds
+  setInterval(() => pollTelegramCommands(), 3 * 1000);
 
   setInterval(async () => {
     const { hour, minute } = getUAETime();
@@ -315,8 +562,17 @@ async function mainLoop() {
     lastMinute = minute;
 
     try {
+      if (isWeekend()) return; // markets closed Sat/Sun — skip all messages
       if (hour === 17 && minute === 0)  await sendDailyBriefing();
       if (hour === 0  && minute === 30) await sendEODSummary();
+
+      // End-of-day paper trade report: Friday gets the full weekly close,
+      // every other trading day gets a lighter daily status update.
+      if (hour === 0 && minute === 45) {
+        if (isFriday()) await sendFridayClosingReport();
+        else             await sendDailyPaperStatus();
+      }
+
       if (isMarketHours() && minute % 5 === 0) await checkPriceAlerts();
     } catch (err) {
       console.error('Scheduler error:', err.message);
@@ -330,4 +586,16 @@ mainLoop();
 // daily briefing without waiting for 5 PM UAE time.
 if (process.argv[2] === 'test') {
   setTimeout(() => sendDailyBriefing(), 2000);
+}
+
+// Manual test: run "node bot.js paperstatus" to test the daily
+// open-trades status update immediately.
+if (process.argv[2] === 'paperstatus') {
+  setTimeout(() => sendDailyPaperStatus(), 2000);
+}
+
+// Manual test: run "node bot.js friday" to test the weekly
+// closing report immediately (works any day, for testing).
+if (process.argv[2] === 'friday') {
+  setTimeout(() => sendFridayClosingReport(), 2000);
 }
