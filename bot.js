@@ -292,17 +292,26 @@ async function buildDailyRecommendations() {
     const entryLow  = +(price * (1 - vol * 0.3)).toFixed(2);
     const entryHigh = +(price * (1 + vol * 0.3)).toFixed(2);
 
-    // Target: capped at +6% max, scaled by RSI (oversold = higher target)
-    // Using Math.min to enforce hard 6% cap regardless of volatility
+    // Target: min +3%, max +6%, scaled by RSI
     const targetMultiplier = rsi < 40 ? 1.5 : rsi < 55 ? 1.2 : 1.0;
     const rawTarget = price * (1 + vol * targetMultiplier);
     const cappedTarget = Math.min(rawTarget, price * 1.06); // never more than +6%
-    const target = +cappedTarget.toFixed(2);
+    const flooredTarget = Math.max(cappedTarget, price * 1.03); // never less than +3%
+    const target = +flooredTarget.toFixed(2);
 
-    // Stop: capped at -4% max
+    // Stop: min -2%, max -4%
     const rawStop = price * (1 - vol * 0.8);
-    const cappedStop = Math.max(rawStop, price * 0.96); // never more than -4%
-    const stop = +cappedStop.toFixed(2);
+    const cappedStop = Math.max(rawStop, price * 0.96); // never wider than -4%
+    const flooredStop = Math.min(cappedStop, price * 0.98); // never tighter than -2%
+    const stop = +flooredStop.toFixed(2);
+
+    // Skip trade if risk/reward below 1.5 — not worth taking
+    const upside   = (target - price) / price;
+    const downside = (price - stop)   / price;
+    if (upside / downside < 1.5) {
+      console.log(`Skipped ${stock.ticker} — poor risk/reward ${(upside/downside).toFixed(1)}:1`);
+      continue;
+    }
 
     let score = 0;
     if (rsi < 35) score += 40;
