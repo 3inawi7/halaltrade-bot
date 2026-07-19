@@ -282,20 +282,32 @@ async function buildDailyRecommendations() {
     }
 
     const price = day.price;
+
+    // Hard exclude: RSI above 70 = overbought, never buy
+    if (rsi > 70) {
+      console.log(`Skipped ${stock.ticker} — RSI ${rsi.toFixed(0)} overbought`);
+      continue;
+    }
+
     const entryLow  = +(price * (1 - vol * 0.3)).toFixed(2);
     const entryHigh = +(price * (1 + vol * 0.3)).toFixed(2);
 
-    // Target: 4-6% realistic weekly move (was 3.5x = 10-14%, now 1.5x = 4-6%)
-    const targetMultiplier = rsi < 40 ? 1.8 : rsi < 55 ? 1.5 : 1.2;
-    const target = +(price * (1 + vol * targetMultiplier)).toFixed(2);
+    // Target: capped at +6% max, scaled by RSI (oversold = higher target)
+    // Using Math.min to enforce hard 6% cap regardless of volatility
+    const targetMultiplier = rsi < 40 ? 1.5 : rsi < 55 ? 1.2 : 1.0;
+    const rawTarget = price * (1 + vol * targetMultiplier);
+    const cappedTarget = Math.min(rawTarget, price * 1.06); // never more than +6%
+    const target = +cappedTarget.toFixed(2);
 
-    // Stop: tight at 3-4% (was 1.6x = 8-9%, now 0.8x = 3-4%)
-    const stop = +(price * (1 - vol * 0.8)).toFixed(2);
+    // Stop: capped at -4% max
+    const rawStop = price * (1 - vol * 0.8);
+    const cappedStop = Math.max(rawStop, price * 0.96); // never more than -4%
+    const stop = +cappedStop.toFixed(2);
 
     let score = 0;
     if (rsi < 35) score += 40;
     else if (rsi < 45) score += 25;
-    else if (rsi > 70) score -= 30;
+    else if (rsi < 60) score += 10;
 
     score += Math.max(0, 15 - Math.abs(day.change_pct));
     score += vol > 0.02 ? 10 : 0;
@@ -533,7 +545,17 @@ async function pollTelegramCommands() {
       console.log(`[${new Date().toISOString()}] Command received: ${text}`);
 
       if (text === '/today' || text === '/picks') {
-        await sendTelegram('🔄 Generating today\'s picks now...');
+        if (isWeekend()) {
+          await sendTelegram([
+            `⚠️ <b>Markets are closed today (weekend)</b>`,
+            ``,
+            `US markets open Monday 5:30 PM UAE time.`,
+            `These picks are based on Friday's closing prices — not actionable until Monday.`,
+            ``,
+            `Send /today on Monday after 5:00 PM UAE for live picks.`
+          ].join('\n'));
+        }
+        await sendTelegram('🔄 Generating picks from latest data (note: weekend prices)...');
         await sendDailyBriefing();
       } else if (text === '/status') {
         await sendTelegram('🔄 Checking open paper trades...');
