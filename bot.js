@@ -83,12 +83,21 @@ async function evaluateOpenTrades() {
 
   for (const trade of open) {
     const day = await getPrevDay(trade.ticker);
+    const intraday = await getIntradayRange(trade.ticker);
     if (!day) continue;
 
     const currentPrice = day.price;
+    const intradayHigh = intraday?.high || currentPrice;
+    const intradayLow  = intraday?.low  || currentPrice;
+
+    // Use intraday low to detect stop hits — a stop can be breached
+    // intraday even if the stock closes above it by end of day.
+    // Use intraday high to detect target hits similarly.
     let outcome = 'OPEN ⏳';
-    if (currentPrice >= trade.target)      outcome = 'TARGET HIT ✅';
-    else if (currentPrice <= trade.stop)   outcome = 'STOP HIT 🛑';
+    if (intradayLow  <= trade.stop)   outcome = 'STOP HIT 🛑';
+    if (intradayHigh >= trade.target) outcome = 'TARGET HIT ✅';
+    // If both hit in same day, stop takes priority (conservative)
+    if (intradayLow <= trade.stop && intradayHigh >= trade.target) outcome = 'STOP HIT 🛑';
 
     const pctMove = (((currentPrice - trade.entryPrice) / trade.entryPrice) * 100);
 
@@ -215,6 +224,22 @@ async function getPrevDay(ticker) {
   return null;
 }
 
+// Fetches today's intraday high and low from Polygon.
+// Critical for correct stop/target detection — a stop can be
+// breached intraday even if the stock recovers to close above it.
+async function getIntradayRange(ticker) {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const url = `https://api.polygon.io/v2/aggs/ticker/${ticker}/range/1/day/${today}/${today}?adjusted=true&apiKey=${POLYGON_KEY}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.results?.length) {
+      return { high: data.results[0].h, low: data.results[0].l };
+    }
+  } catch (e) {}
+  return null;
+}
+
 async function getRSI(ticker) {
   try {
     const url = `https://api.polygon.io/v1/indicators/rsi/${ticker}?timespan=day&window=14&series_type=close&limit=1&apiKey=${POLYGON_KEY}`;
@@ -257,12 +282,15 @@ async function buildDailyRecommendations() {
     }
 
     const price = day.price;
-    const entryLow  = +(price * (1 - vol * 0.5)).toFixed(2);
-    const entryHigh = +(price * (1 + vol * 0.5)).toFixed(2);
+    const entryLow  = +(price * (1 - vol * 0.3)).toFixed(2);
+    const entryHigh = +(price * (1 + vol * 0.3)).toFixed(2);
 
-    const targetMultiplier = rsi < 40 ? 3.5 : rsi < 55 ? 2.5 : 1.8;
+    // Target: 4-6% realistic weekly move (was 3.5x = 10-14%, now 1.5x = 4-6%)
+    const targetMultiplier = rsi < 40 ? 1.8 : rsi < 55 ? 1.5 : 1.2;
     const target = +(price * (1 + vol * targetMultiplier)).toFixed(2);
-    const stop = +(price * (1 - vol * 1.6)).toFixed(2);
+
+    // Stop: tight at 3-4% (was 1.6x = 8-9%, now 0.8x = 3-4%)
+    const stop = +(price * (1 - vol * 0.8)).toFixed(2);
 
     let score = 0;
     if (rsi < 35) score += 40;
@@ -281,7 +309,18 @@ async function buildDailyRecommendations() {
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  return candidates.slice(0, MAX_DAILY_PICKS);
+
+  // Limit: each ticker can only appear MAX 2x per week in the log
+  // This prevents AMD dominating every single day
+  const log = loadLog();
+  const oneWeekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const thisWeekCounts = {};
+  log.filter(t => t.date >= oneWeekAgo).forEach(t => {
+    thisWeekCounts[t.ticker] = (thisWeekCounts[t.ticker] || 0) + 1;
+  });
+
+  const filtered = candidates.filter(c => (thisWeekCounts[c.ticker] || 0) < 2);
+  return filtered.slice(0, MAX_DAILY_PICKS);
 }
 
 function classifySignal(price, pick) {
