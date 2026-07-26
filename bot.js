@@ -36,26 +36,61 @@ const alertsSentToday = new Set();
 // ── Paper trading log ───────────────────────────────────────
 // Records every pick made so we can check 3 trading days later
 // whether the target/stop would actually have hit. No real money.
-const fs = require('fs');
-const path = require('path');
-const LOG_FILE = path.join(__dirname, 'data', 'paper_trades.json');
+// ── Persistent trade log via Telegram ──────────────────────
+// Stores the paper trade log as a pinned message in your Telegram chat.
+// This survives Railway restarts, redeployments, and server wipes.
+// No database needed — Telegram IS the database.
 
-function loadLog() {
+let pinnedMessageId = null; // cached message ID of the log message
+
+async function loadLog() {
   try {
-    if (fs.existsSync(LOG_FILE)) return JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'));
+    // Try to find our log message by looking for pinned message
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getChat?chat_id=${CHAT_ID}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    if (data.ok && data.result?.pinned_message) {
+      const text = data.result.pinned_message.text || '';
+      if (text.startsWith('HALALTRADE_LOG:')) {
+        pinnedMessageId = data.result.pinned_message.message_id;
+        return JSON.parse(text.replace('HALALTRADE_LOG:', ''));
+      }
+    }
   } catch (e) { console.error('loadLog error:', e.message); }
   return [];
 }
 
-function saveLog(log) {
+async function saveLog(log) {
   try {
-    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
-    fs.writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+    const text = 'HALALTRADE_LOG:' + JSON.stringify(log);
+    if (pinnedMessageId) {
+      // Edit the existing pinned message
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, text })
+      });
+    } else {
+      // First time: send and pin a new log message
+      const sent = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: CHAT_ID, text, disable_notification: true })
+      }).then(r => r.json());
+      if (sent.ok) {
+        pinnedMessageId = sent.result.message_id;
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/pinChatMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, disable_notification: true })
+        });
+      }
+    }
   } catch (e) { console.error('saveLog error:', e.message); }
 }
 
-function logPicks(picks) {
-  const log = loadLog();
+async function logPicks(picks) {
+  const log = await loadLog();
   const today = new Date().toISOString().slice(0, 10);
   picks.forEach(p => {
     log.push({
@@ -71,13 +106,13 @@ function logPicks(picks) {
       result: null
     });
   });
-  saveLog(log);
+  await saveLog(log);
 }
 
 // Checks ALL still-open paper trades against current price.
 // Used both for the daily status update and the Friday closing report.
 async function evaluateOpenTrades() {
-  const log = loadLog();
+  const log = await loadLog();
   const open = log.filter(t => !t.closed);
   const results = [];
 
@@ -152,7 +187,7 @@ async function sendDailyPaperStatus() {
 // Friday closing report — full week summary of wins/losses/open
 async function sendFridayClosingReport() {
   await evaluateOpenTrades(); // refresh prices and auto-close any that hit target/stop today
-  const log = loadLog();
+  const log = await loadLog();
 
   const oneWeekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
   const thisWeek = log.filter(t => t.date >= oneWeekAgo);
@@ -343,8 +378,7 @@ async function buildDailyRecommendations() {
   candidates.sort((a, b) => b.score - a.score);
 
   // Limit: each ticker can only appear MAX 2x per week in the log
-  // This prevents AMD dominating every single day
-  const log = loadLog();
+  const log = await loadLog();
   const oneWeekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
   const thisWeekCounts = {};
   log.filter(t => t.date >= oneWeekAgo).forEach(t => {
