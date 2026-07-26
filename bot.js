@@ -82,37 +82,48 @@ async function evaluateOpenTrades() {
   const results = [];
 
   for (const trade of open) {
-    const day = await getPrevDay(trade.ticker);
-    const intraday = await getIntradayRange(trade.ticker);
-    if (!day) continue;
+    // Fetch the full daily price history since entry date
+    // This catches target/stop hits that were missed on previous days
+    const today = new Date().toISOString().slice(0, 10);
+    let intradayHigh = trade.entryPrice;
+    let intradayLow  = trade.entryPrice;
+    let currentPrice = trade.entryPrice;
 
-    const currentPrice = day.price;
-    const intradayHigh = intraday?.high || currentPrice;
-    const intradayLow  = intraday?.low  || currentPrice;
-
-    // Use intraday low to detect stop hits — a stop can be breached
-    // intraday even if the stock closes above it by end of day.
-    // Use intraday high to detect target hits similarly.
-    let outcome = 'OPEN ⏳';
-    if (intradayLow  <= trade.stop)   outcome = 'STOP HIT 🛑';
-    if (intradayHigh >= trade.target) outcome = 'TARGET HIT ✅';
-    // If both hit in same day, stop takes priority (conservative)
-    if (intradayLow <= trade.stop && intradayHigh >= trade.target) outcome = 'STOP HIT 🛑';
+    try {
+      const url = `https://api.polygon.io/v2/aggs/ticker/${trade.ticker}/range/1/day/${trade.date}/${today}?adjusted=true&sort=asc&limit=10&apiKey=${POLYGON_KEY}`;
+      const res  = await fetch(url);
+      const data = await res.json();
+      if (data.results?.length) {
+        // Scan ALL days since entry to find if target or stop was ever hit
+        intradayHigh = Math.max(...data.results.map(d => d.h));
+        intradayLow  = Math.min(...data.results.map(d => d.l));
+        currentPrice = data.results[data.results.length - 1].c; // latest close
+      }
+    } catch (e) {
+      console.error(`History fetch error ${trade.ticker}:`, e.message);
+      continue;
+    }
 
     const pctMove = (((currentPrice - trade.entryPrice) / trade.entryPrice) * 100);
 
+    // Check if target or stop was ever hit across all days since entry
+    let outcome = 'OPEN ⏳';
+    if (intradayLow  <= trade.stop)   outcome = 'STOP HIT 🛑';
+    if (intradayHigh >= trade.target) outcome = 'TARGET HIT ✅';
+    // If both hit, stop takes priority (conservative assumption)
+    if (intradayLow <= trade.stop && intradayHigh >= trade.target) outcome = 'STOP HIT 🛑';
+
     results.push({ trade, currentPrice, outcome, pctMove });
 
-    // Auto-close trades that hit target or stop so they don't get re-reported forever
     if (outcome !== 'OPEN ⏳') {
-      trade.closed = true;
-      trade.result = outcome;
+      trade.closed    = true;
+      trade.result    = outcome;
       trade.closedPrice = currentPrice;
-      trade.closedPct = pctMove;
-      trade.closedDate = new Date().toISOString().slice(0, 10);
+      trade.closedPct   = pctMove;
+      trade.closedDate  = today;
     }
 
-    await new Promise(r => setTimeout(r, 4000)); // rate limit safety
+    await new Promise(r => setTimeout(r, 4000));
   }
 
   saveLog(log);
