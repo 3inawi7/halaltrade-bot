@@ -97,7 +97,18 @@ async function saveLog(log) {
 async function logPicks(picks) {
   const log = await loadLog();
   const today = new Date().toISOString().slice(0, 10);
+
+  // Prevent duplicates — don't log the same ticker twice on the same day
+  const alreadyLoggedToday = new Set(
+    log.filter(t => t.date === today).map(t => t.ticker)
+  );
+
+  let added = 0;
   picks.forEach(p => {
+    if (alreadyLoggedToday.has(p.ticker)) {
+      console.log(`Skipping duplicate log for ${p.ticker} on ${today}`);
+      return;
+    }
     log.push({
       date: today,
       ticker: p.ticker,
@@ -110,8 +121,11 @@ async function logPicks(picks) {
       closed: false,
       result: null
     });
+    added++;
   });
-  await saveLog(log);
+
+  if (added > 0) await saveLog(log);
+  console.log(`Logged ${added} new picks (${picks.length - added} duplicates skipped)`);
 }
 
 // Checks ALL still-open paper trades against current price.
@@ -629,6 +643,7 @@ async function pollTelegramCommands() {
           `/today — Get fresh picks right now`,
           `/status — Check open paper trades`,
           `/weekly — Full weekly closing report`,
+          `/cleardupes — Remove duplicate picks from log`,
           `/help — Show this menu`,
           ``,
           `Scheduled automatically:`,
@@ -636,6 +651,18 @@ async function pollTelegramCommands() {
           `📋 12:45 AM UAE — daily status (Mon–Thu)`,
           `🌙 12:45 AM UAE Friday — weekly closing report`
         ].join('\n'));
+      } else if (text === '/cleardupes') {
+        const log = await loadLog();
+        const seen = new Set();
+        const cleaned = log.filter(t => {
+          const key = `${t.date}-${t.ticker}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        const removed = log.length - cleaned.length;
+        await saveLog(cleaned);
+        await sendTelegram(`🧹 Removed ${removed} duplicate entries from the log.\n${cleaned.length} unique picks remaining.`);
       }
     }
   } catch (err) {
