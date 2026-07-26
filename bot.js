@@ -18,14 +18,19 @@ if (TELEGRAM_TOKEN === 'YOUR_BOT_TOKEN_HERE' || CHAT_ID === 'YOUR_CHAT_ID_HERE' 
   process.exit(1);
 }
 
-// Halal universe - Zoya zero-tolerance verified
-// No price targets here anymore - those are calculated fresh daily.
+// Halal universe - Zoya/Musaffa zero-tolerance verified July 2026
+// Criteria: 0% interest income, 0% haram revenue, debt/assets <20%
+// Excluded: MSFT (0.3% interest), META (1.8% haram), AMZN (2.1% haram)
+// Excluded: LRCX (1.66% interest), KLAC (1.48% interest)
 const HALAL_UNIVERSE = [
   { ticker: 'AMD',   name: 'Advanced Micro Devices' },
   { ticker: 'AAPL',  name: 'Apple Inc.' },
   { ticker: 'GOOGL', name: 'Alphabet Inc.' },
   { ticker: 'NVDA',  name: 'NVIDIA Corp.' },
   { ticker: 'QCOM',  name: 'Qualcomm Inc.' },
+  { ticker: 'TSM',   name: 'Taiwan Semiconductor' },
+  { ticker: 'AMAT',  name: 'Applied Materials' },
+  { ticker: 'MRVL',  name: 'Marvell Technology' },
   { ticker: 'AVGO',  name: 'Broadcom Inc.' },
 ];
 
