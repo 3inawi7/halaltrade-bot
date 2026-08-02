@@ -160,12 +160,17 @@ async function evaluateOpenTrades() {
 
     const pctMove = (((currentPrice - trade.entryPrice) / trade.entryPrice) * 100);
 
-    // Check if target or stop was ever hit across all days since entry
+    // Fair stop/target classification:
+    // - TARGET HIT if intraday high reached target
+    // - STOP HIT only if intraday low hit stop AND closing price stayed below stop
+    //   (prevents false stop-hits where stock dipped then recovered strongly)
+    // - If both triggered, use closing price to decide winner
     let outcome = 'OPEN ⏳';
-    if (intradayLow  <= trade.stop)   outcome = 'STOP HIT 🛑';
     if (intradayHigh >= trade.target) outcome = 'TARGET HIT ✅';
-    // If both hit, stop takes priority (conservative assumption)
-    if (intradayLow <= trade.stop && intradayHigh >= trade.target) outcome = 'STOP HIT 🛑';
+    if (intradayLow <= trade.stop && currentPrice <= trade.stop * 1.02) outcome = 'STOP HIT 🛑';
+    if (intradayLow <= trade.stop && intradayHigh >= trade.target) {
+      outcome = currentPrice >= trade.entryPrice ? 'TARGET HIT ✅' : 'STOP HIT 🛑';
+    }
 
     results.push({ trade, currentPrice, outcome, pctMove });
 
@@ -331,6 +336,31 @@ async function getVolatility(ticker) {
   return 0.02;
 }
 
+// Known upcoming earnings dates — update weekly
+// Bot skips any stock within 5 trading days of its earnings report
+// This prevents the AAPL -7.2% earnings gap situation from repeating
+const EARNINGS_DATES = {
+  'AAPL': '2026-10-29', // next earnings after July 30 report
+  'AMD':  '2026-10-28',
+  'NVDA': '2026-08-27',
+  'GOOGL':'2026-10-28',
+  'QCOM': '2026-10-22',
+  'AVGO': '2026-09-11',
+  'TSM':  '2026-10-16',
+  'AMAT': '2026-08-14',
+  'MRVL': '2026-09-04',
+};
+
+function isNearEarnings(ticker) {
+  const dateStr = EARNINGS_DATES[ticker];
+  if (!dateStr) return false;
+  const earningsDate = new Date(dateStr);
+  const today = new Date();
+  const daysUntil = (earningsDate - today) / (1000 * 60 * 60 * 24);
+  // Skip if within 5 days before OR 2 days after earnings
+  return daysUntil >= -2 && daysUntil <= 5;
+}
+
 async function buildDailyRecommendations() {
   const candidates = [];
 
@@ -351,6 +381,12 @@ async function buildDailyRecommendations() {
     // Hard exclude: RSI above 70 = overbought, never buy
     if (rsi > 70) {
       console.log(`Skipped ${stock.ticker} — RSI ${rsi.toFixed(0)} overbought`);
+      continue;
+    }
+
+    // Hard exclude: within 5 days of earnings = binary event risk
+    if (isNearEarnings(stock.ticker)) {
+      console.log(`Skipped ${stock.ticker} — near earnings date`);
       continue;
     }
 
@@ -636,6 +672,15 @@ async function pollTelegramCommands() {
       } else if (text === '/weekly' || text === '/friday') {
         await sendTelegram('🔄 Building weekly closing report...');
         await sendFridayClosingReport();
+      } else if (text === '/earnings') {
+        const lines = [`📅 <b>Upcoming Earnings Dates</b>`, `<i>Bot skips stocks within 5 days of earnings</i>`, ``];
+        const today = new Date();
+        Object.entries(EARNINGS_DATES).sort((a,b) => new Date(a[1]) - new Date(b[1])).forEach(([ticker, date]) => {
+          const days = Math.round((new Date(date) - today) / (1000*60*60*24));
+          const flag = days <= 5 && days >= -2 ? ' ⚠️ SKIP THIS WEEK' : '';
+          lines.push(`<b>${ticker}</b>: ${date} (${days > 0 ? `in ${days} days` : `${Math.abs(days)} days ago`})${flag}`);
+        });
+        await sendTelegram(lines.join('\n'));
       } else if (text === '/help' || text === '/start') {
         await sendTelegram([
           `🤖 <b>HalalTrade Bot Commands</b>`,
@@ -643,6 +688,7 @@ async function pollTelegramCommands() {
           `/today — Get fresh picks right now`,
           `/status — Check open paper trades`,
           `/weekly — Full weekly closing report`,
+          `/earnings — Show upcoming earnings dates`,
           `/cleardupes — Remove duplicate picks from log`,
           `/help — Show this menu`,
           ``,
