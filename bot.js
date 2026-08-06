@@ -507,6 +507,20 @@ async function sendDailyBriefing() {
     lines.push(`   💰 Max profit: +$${profit}  |  Max loss: -$${lossAmt}`);
     lines.push(`   ☽ 0% interest · 0% haram`);
     lines.push(``);
+
+    // Baraka trade card — copy these values directly into the Baraka app
+    lines.push(`   📲 <b>Baraka order card:</b>`);
+    lines.push(`   ┌─────────────────────────`);
+    lines.push(`   │ Stock:      ${p.ticker}`);
+    lines.push(`   │ Order:      Limit Buy`);
+    lines.push(`   │ Shares:     ${shares}`);
+    lines.push(`   │ Limit $:    $${p.entryLow} (max $${p.entryHigh})`);
+    lines.push(`   │ Stop-loss:  $${p.stop}`);
+    lines.push(`   │ Target:     $${p.target}`);
+    lines.push(`   │ Capital:    $${dollars}`);
+    lines.push(`   └─────────────────────────`);
+    lines.push(`   ⏰ Set stop-loss immediately after fill`);
+    lines.push(``);
   });
 
   lines.push(`<b>━━━ RULES ━━━</b>`);
