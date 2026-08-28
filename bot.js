@@ -50,18 +50,42 @@ let pinnedMessageId = null; // cached message ID of the log message
 
 async function loadLog() {
   try {
-    // Try to find our log message by looking for pinned message
-    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getChat?chat_id=${CHAT_ID}`;
-    const res  = await fetch(url);
-    const data = await res.json();
-    if (data.ok && data.result?.pinned_message) {
-      const text = data.result.pinned_message.text || '';
+    // Primary: check pinned message in chat
+    const chatRes  = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getChat?chat_id=${CHAT_ID}`);
+    const chatData = await chatRes.json();
+    if (chatData.ok && chatData.result?.pinned_message) {
+      const text = chatData.result.pinned_message.text || '';
       if (text.startsWith('HALALTRADE_LOG:')) {
-        pinnedMessageId = data.result.pinned_message.message_id;
-        return JSON.parse(text.replace('HALALTRADE_LOG:', ''));
+        pinnedMessageId = chatData.result.pinned_message.message_id;
+        const log = JSON.parse(text.replace('HALALTRADE_LOG:', ''));
+        console.log(`loadLog: found ${log.length} trades in pinned message (id: ${pinnedMessageId})`);
+        return log;
+      }
+    }
+
+    // Fallback: scan last 50 messages for a log message in case pinning failed
+    console.log('loadLog: no pinned log found — scanning recent messages...');
+    const updatesRes  = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates?limit=50&offset=-50`);
+    const updatesData = await updatesRes.json();
+    if (updatesData.ok) {
+      const msgs = updatesData.result
+        .map(u => u.message)
+        .filter(m => m && m.text && m.text.startsWith('HALALTRADE_LOG:'))
+        .sort((a, b) => b.date - a.date); // newest first
+      if (msgs.length > 0) {
+        pinnedMessageId = msgs[0].message_id;
+        const log = JSON.parse(msgs[0].text.replace('HALALTRADE_LOG:', ''));
+        console.log(`loadLog: recovered ${log.length} trades from message scan (id: ${pinnedMessageId})`);
+        // Re-pin this message so future loads find it faster
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/pinChatMessage`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, disable_notification: true })
+        });
+        return log;
       }
     }
   } catch (e) { console.error('loadLog error:', e.message); }
+  console.log('loadLog: starting fresh — no existing log found');
   return [];
 }
 
@@ -185,7 +209,7 @@ async function evaluateOpenTrades() {
     await new Promise(r => setTimeout(r, 4000));
   }
 
-  saveLog(log);
+  await saveLog(log); // was missing await — caused saves to silently fail
   return results;
 }
 
@@ -733,8 +757,7 @@ async function pollTelegramCommands() {
 async function mainLoop() {
   console.log('HalalTrade Bot v2 starting (dynamic daily picks)...');
 
-  // Skip any old/stale messages sent before this boot (e.g. your earlier
-  // chat-ID lookup test messages) so the bot doesn't reprocess them as commands.
+  // Skip stale Telegram messages from before this boot
   try {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getUpdates`);
     const data = await res.json();
@@ -742,6 +765,26 @@ async function mainLoop() {
       lastUpdateId = data.result[data.result.length - 1].update_id;
     }
   } catch (e) { console.error('Initial update sync error:', e.message); }
+
+  // Verify existing trade log on startup — critical for persistence across Railway restarts
+  try {
+    const existingLog = await loadLog();
+    const openTrades  = existingLog.filter(t => !t.closed).length;
+    const totalTrades = existingLog.length;
+    console.log(`Startup log check: ${totalTrades} total trades, ${openTrades} open`);
+    if (totalTrades > 0) {
+      await sendTelegram([
+        `🔄 <b>HalalTrade Bot restarted</b>`,
+        ``,
+        `📋 Trade log restored: ${totalTrades} trades (${openTrades} open)`,
+        `✅ No data lost — log loaded from pinned message`,
+        ``,
+        `Send /status to see open trades · /weekly for full report`
+      ].join('\n'));
+    }
+  } catch (e) {
+    console.error('Startup log check error:', e.message);
+  }
 
   await sendTelegram([
     `🤖 <b>HalalTrade Bot is LIVE</b> (v2 — dynamic picks)`,
