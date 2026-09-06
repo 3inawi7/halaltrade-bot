@@ -355,52 +355,46 @@ async function getIntradayRange(ticker) {
 
 // Calculate RSI — 15-min bars during market hours, daily bars on weekends
 async function getRSI(ticker) {
-  // Try intraday 15-min first
+  // Try intraday 15-min first (works during market hours)
   try {
     const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=15Min&limit=28&feed=iex`;
     const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
     if (data.bars?.length >= 15) {
-      const closes = data.bars.map(b => b.c);
-      let gains = 0, losses = 0;
-      for (let i = 1; i <= 14; i++) {
-        const diff = closes[i] - closes[i - 1];
-        if (diff > 0) gains += diff; else losses -= diff;
-      }
-      let avgGain = gains / 14, avgLoss = losses / 14;
-      for (let i = 15; i < closes.length; i++) {
-        const diff = closes[i] - closes[i - 1];
-        avgGain = (avgGain * 13 + Math.max(diff, 0))  / 14;
-        avgLoss = (avgLoss * 13 + Math.max(-diff, 0)) / 14;
-      }
-      if (avgLoss === 0) return 100;
-      return 100 - (100 / (1 + avgGain / avgLoss));
+      return calcRSI(data.bars.map(b => b.c));
     }
   } catch (e) {}
 
-  // Fallback: daily RSI from last 20 bars (works on weekends)
+  // Fallback: daily bars — works on weekends and after hours
   try {
     const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=20&feed=iex`;
     const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
-    if (data.bars?.length >= 15) {
-      const closes = data.bars.map(b => b.c);
-      let gains = 0, losses = 0;
-      for (let i = 1; i <= 14; i++) {
-        const diff = closes[i] - closes[i - 1];
-        if (diff > 0) gains += diff; else losses -= diff;
-      }
-      let avgGain = gains / 14, avgLoss = losses / 14;
-      for (let i = 15; i < closes.length; i++) {
-        const diff = closes[i] - closes[i - 1];
-        avgGain = (avgGain * 13 + Math.max(diff, 0))  / 14;
-        avgLoss = (avgLoss * 13 + Math.max(-diff, 0)) / 14;
-      }
-      if (avgLoss === 0) return 100;
-      return 100 - (100 / (1 + avgGain / avgLoss));
+    if (data.bars?.length >= 5) { // only need 5+ bars minimum
+      return calcRSI(data.bars.map(b => b.c));
     }
   } catch (e) { console.error(`getRSI error ${ticker}:`, e.message); }
   return null;
+}
+
+// Standard Wilder RSI calculation from array of closing prices
+function calcRSI(closes) {
+  if (closes.length < 2) return 50; // default neutral
+  const periods = Math.min(14, closes.length - 1);
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= periods; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  let avgGain = gains / periods;
+  let avgLoss = losses / periods;
+  for (let i = periods + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (periods - 1) + Math.max(diff, 0))  / periods;
+    avgLoss = (avgLoss * (periods - 1) + Math.max(-diff, 0)) / periods;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
 // Calculate 20-day average volatility from Alpaca daily bars
@@ -409,7 +403,7 @@ async function getVolatility(ticker) {
     const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=22&feed=iex`;
     const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
-    if (data.bars?.length >= 5) {
+    if (data.bars?.length >= 3) {
       const ranges = data.bars.map(b => (b.h - b.l) / b.c);
       return ranges.reduce((a, b) => a + b, 0) / ranges.length;
     }
