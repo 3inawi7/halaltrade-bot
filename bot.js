@@ -792,6 +792,27 @@ async function pollTelegramCommands() {
           `📋 12:45 AM UAE — daily status (Mon–Thu)`,
           `🌙 12:45 AM UAE Friday — weekly closing report`
         ].join('\n'));
+      } else if (text === '/debug') {
+        // Shows first/last 4 chars of keys so we can verify they loaded correctly
+        const keyPreview    = ALPACA_KEY    ? `${ALPACA_KEY.slice(0,4)}...${ALPACA_KEY.slice(-4)}`    : 'MISSING';
+        const secretPreview = ALPACA_SECRET ? `${ALPACA_SECRET.slice(0,4)}...${ALPACA_SECRET.slice(-4)}` : 'MISSING';
+        // Test a live fetch
+        let fetchTest = 'not tested';
+        try {
+          const testRes  = await fetch(`${ALPACA_DATA_URL}/stocks/AMD/bars/latest?feed=iex`, { headers: ALPACA_HEADERS });
+          const testData = await testRes.json();
+          fetchTest = testData.bar ? `✅ AMD price: $${testData.bar.c}` : `❌ No bar returned: ${JSON.stringify(testData).slice(0,100)}`;
+        } catch (e) { fetchTest = `❌ Error: ${e.message}`; }
+        await sendTelegram([
+          `🔧 <b>Debug Info</b>`,
+          ``,
+          `ALPACA_KEY: ${keyPreview}`,
+          `ALPACA_SECRET: ${secretPreview}`,
+          `Data URL: ${ALPACA_DATA_URL}`,
+          ``,
+          `Live fetch test:`,
+          fetchTest
+        ].join('\n'));
       } else if (text === '/cleardupes') {
         const log = await loadLog();
         const seen = new Set();
