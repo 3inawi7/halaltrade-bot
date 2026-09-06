@@ -170,20 +170,25 @@ async function evaluateOpenTrades() {
   const results = [];
 
   for (const trade of open) {
-    // Fetch full daily price history since entry using Alpaca
+    // Fetch full price history since entry using Yahoo Finance
     const today = new Date().toISOString().slice(0, 10);
     let intradayHigh = trade.entryPrice;
     let intradayLow  = trade.entryPrice;
     let currentPrice = trade.entryPrice;
 
     try {
-      const url = `${ALPACA_DATA_URL}/stocks/${trade.ticker}/bars?timeframe=1Day&start=${trade.date}&end=${today}&feed=iex&limit=10`;
-      const res  = await fetch(url, { headers: ALPACA_HEADERS });
+      const daysSinceEntry = Math.ceil((new Date(today) - new Date(trade.date)) / 86400000) + 5;
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${trade.ticker}?interval=1d&range=${daysSinceEntry}d`;
+      const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       const data = await res.json();
-      if (data.bars?.length) {
-        intradayHigh = Math.max(...data.bars.map(b => b.h));
-        intradayLow  = Math.min(...data.bars.map(b => b.l));
-        currentPrice = data.bars[data.bars.length - 1].c;
+      const result = data.chart?.result?.[0];
+      if (result) {
+        const highs  = result.indicators.quote[0].high.filter(h => h);
+        const lows   = result.indicators.quote[0].low.filter(l => l);
+        const closes = result.indicators.quote[0].close.filter(c => c);
+        if (highs.length)  intradayHigh = Math.max(...highs);
+        if (lows.length)   intradayLow  = Math.min(...lows);
+        if (closes.length) currentPrice = closes[closes.length - 1];
       }
     } catch (e) {
       console.error(`History fetch error ${trade.ticker}:`, e.message);
@@ -312,103 +317,110 @@ async function sendTelegram(message) {
   return data;
 }
 
-// ── Alpaca data fetchers — real-time, free ──────────────────
+// ── Data fetchers ───────────────────────────────────────────
+// Alpaca: real-time latest price (works always, free)
+// Yahoo Finance: historical daily bars for RSI + volatility (free, no key, works on weekends)
 
-// Get latest bar from Alpaca — iex feed works on free accounts
 async function getPrevDay(ticker) {
+  // Real-time latest price from Alpaca
   try {
-    // Try latest bar first
-    const latestUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars/latest?feed=iex`;
-    const latestRes  = await fetch(latestUrl, { headers: ALPACA_HEADERS });
-    const latestData = await latestRes.json();
-    if (latestData.bar) {
-      const b = latestData.bar;
-      return { price: b.c, open: b.o, high: b.h, low: b.l, volume: b.v,
-        change_pct: (((b.c - b.o) / b.o) * 100) };
-    }
-    // Fallback: last 5 daily bars
-    const barsUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=5&feed=iex`;
-    const barsRes  = await fetch(barsUrl, { headers: ALPACA_HEADERS });
-    const barsData = await barsRes.json();
-    if (barsData.bars?.length) {
-      const b = barsData.bars[barsData.bars.length - 1];
-      return { price: b.c, open: b.o, high: b.h, low: b.l, volume: b.v,
-        change_pct: (((b.c - b.o) / b.o) * 100) };
+    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars/latest?feed=iex`;
+    const res  = await fetch(url, { headers: ALPACA_HEADERS });
+    const data = await res.json();
+    if (data.bar) {
+      const b = data.bar;
+      // Get yesterday's close from Yahoo for accurate change_pct
+      const hist = await getYahooHistory(ticker, 2);
+      const prevClose = hist.length >= 2 ? hist[hist.length - 2] : b.o;
+      return {
+        price:      b.c,
+        open:       prevClose,
+        high:       b.h,
+        low:        b.l,
+        volume:     b.v,
+        change_pct: (((b.c - prevClose) / prevClose) * 100)
+      };
     }
   } catch (e) { console.error(`getPrevDay error ${ticker}:`, e.message); }
+  // Fallback: use Yahoo latest close
+  try {
+    const hist = await getYahooHistory(ticker, 2);
+    if (hist.length >= 1) {
+      const price = hist[hist.length - 1];
+      const prev  = hist.length >= 2 ? hist[hist.length - 2] : price;
+      return { price, open: prev, high: price, low: price, volume: 0,
+        change_pct: (((price - prev) / prev) * 100) };
+    }
+  } catch (e) {}
   return null;
 }
 
-// Get today's intraday high/low from Alpaca 1-minute bars
+// Fetch historical daily closes from Yahoo Finance — free, no API key, works on weekends
+async function getYahooHistory(ticker, days = 30) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=${Math.ceil(days * 1.5)}d`;
+    const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const data = await res.json();
+    const closes = data.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+    if (closes?.length) return closes.filter(c => c !== null && c !== undefined);
+  } catch (e) { console.error(`Yahoo history error ${ticker}:`, e.message); }
+  return [];
+}
+
+// Calculate RSI from Yahoo Finance historical closes — works on weekends
+async function getRSI(ticker) {
+  try {
+    const closes = await getYahooHistory(ticker, 30);
+    if (closes.length >= 5) return calcRSI(closes);
+  } catch (e) { console.error(`getRSI error ${ticker}:`, e.message); }
+  return null;
+}
+
+// Calculate 20-day volatility from Yahoo Finance historical closes
+async function getVolatility(ticker) {
+  try {
+    const closes = await getYahooHistory(ticker, 25);
+    if (closes.length >= 3) {
+      // Estimate daily range as % of close using day-to-day moves as proxy
+      const moves = [];
+      for (let i = 1; i < closes.length; i++) {
+        moves.push(Math.abs(closes[i] - closes[i-1]) / closes[i-1]);
+      }
+      return moves.reduce((a, b) => a + b, 0) / moves.length;
+    }
+  } catch (e) {}
+  return 0.02;
+}
+
+// Get today's intraday high/low from Alpaca
 async function getIntradayRange(ticker) {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&start=${today}&feed=iex&limit=1`;
     const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
-    if (data.bars?.length) {
-      return { high: data.bars[0].h, low: data.bars[0].l };
-    }
+    if (data.bars?.length) return { high: data.bars[0].h, low: data.bars[0].l };
   } catch (e) {}
   return null;
 }
 
-// Calculate RSI — 15-min bars during market hours, daily bars on weekends
-async function getRSI(ticker) {
-  // Try intraday 15-min first (works during market hours)
-  try {
-    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=15Min&limit=28&feed=iex`;
-    const res  = await fetch(url, { headers: ALPACA_HEADERS });
-    const data = await res.json();
-    if (data.bars?.length >= 15) {
-      return calcRSI(data.bars.map(b => b.c));
-    }
-  } catch (e) {}
-
-  // Fallback: daily bars — works on weekends and after hours
-  try {
-    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=20&feed=iex`;
-    const res  = await fetch(url, { headers: ALPACA_HEADERS });
-    const data = await res.json();
-    if (data.bars?.length >= 5) { // only need 5+ bars minimum
-      return calcRSI(data.bars.map(b => b.c));
-    }
-  } catch (e) { console.error(`getRSI error ${ticker}:`, e.message); }
-  return null;
-}
-
-// Standard Wilder RSI calculation from array of closing prices
+// Standard Wilder RSI calculation
 function calcRSI(closes) {
-  if (closes.length < 2) return 50; // default neutral
+  if (closes.length < 2) return 50;
   const periods = Math.min(14, closes.length - 1);
   let gains = 0, losses = 0;
   for (let i = 1; i <= periods; i++) {
     const diff = closes[i] - closes[i - 1];
     if (diff > 0) gains += diff; else losses -= diff;
   }
-  let avgGain = gains / periods;
-  let avgLoss = losses / periods;
+  let avgGain = gains / periods, avgLoss = losses / periods;
   for (let i = periods + 1; i < closes.length; i++) {
     const diff = closes[i] - closes[i - 1];
-    avgGain = (avgGain * (periods - 1) + Math.max(diff, 0))  / periods;
-    avgLoss = (avgLoss * (periods - 1) + Math.max(-diff, 0)) / periods;
+    avgGain = (avgGain * (periods-1) + Math.max(diff, 0))  / periods;
+    avgLoss = (avgLoss * (periods-1) + Math.max(-diff, 0)) / periods;
   }
   if (avgLoss === 0) return 100;
   return 100 - (100 / (1 + avgGain / avgLoss));
-}
-
-// Calculate 20-day average volatility from Alpaca daily bars
-async function getVolatility(ticker) {
-  try {
-    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=22&feed=iex`;
-    const res  = await fetch(url, { headers: ALPACA_HEADERS });
-    const data = await res.json();
-    if (data.bars?.length >= 3) {
-      const ranges = data.bars.map(b => (b.h - b.l) / b.c);
-      return ranges.reduce((a, b) => a + b, 0) / ranges.length;
-    }
-  } catch (e) {}
-  return 0.02;
 }
 
 // Known upcoming earnings dates — update weekly
@@ -441,7 +453,7 @@ async function buildDailyRecommendations() {
   console.log('Starting buildDailyRecommendations...');
 
   for (const stock of HALAL_UNIVERSE) {
-    await new Promise(r => setTimeout(r, 2000)); // reduced delay since no rate limit
+    await new Promise(r => setTimeout(r, 300)); // Yahoo has no rate limit
 
     const day = await getPrevDay(stock.ticker);
     const rsi = await getRSI(stock.ticker);
