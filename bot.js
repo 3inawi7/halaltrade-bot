@@ -444,54 +444,54 @@ function isNearEarnings(ticker) {
 
 async function buildDailyRecommendations() {
   const candidates = [];
+  console.log('Starting buildDailyRecommendations...');
 
   for (const stock of HALAL_UNIVERSE) {
-    // Small delay between tickers to stay under Polygon's free-tier rate limit (5 req/min)
-    await new Promise(r => setTimeout(r, 4000));
+    await new Promise(r => setTimeout(r, 2000)); // reduced delay since no rate limit
 
     const day = await getPrevDay(stock.ticker);
     const rsi = await getRSI(stock.ticker);
     const vol = await getVolatility(stock.ticker);
+
+    console.log(`${stock.ticker}: price=${day?.price} rsi=${rsi?.toFixed(1)} vol=${vol?.toFixed(4)}`);
+
     if (!day || rsi === null) {
-      console.log(`Skipped ${stock.ticker} — missing data (day:${!!day}, rsi:${rsi})`);
+      console.log(`${stock.ticker}: SKIPPED — missing data`);
       continue;
     }
 
     const price = day.price;
 
-    // Hard exclude: RSI above 70 = overbought, never buy
     if (rsi > 70) {
-      console.log(`Skipped ${stock.ticker} — RSI ${rsi.toFixed(0)} overbought`);
+      console.log(`${stock.ticker}: SKIPPED — RSI ${rsi.toFixed(0)} overbought`);
       continue;
     }
 
-    // Hard exclude: within 5 days of earnings = binary event risk
     if (isNearEarnings(stock.ticker)) {
-      console.log(`Skipped ${stock.ticker} — near earnings date`);
+      console.log(`${stock.ticker}: SKIPPED — near earnings`);
       continue;
     }
 
     const entryLow  = +(price * (1 - vol * 0.3)).toFixed(2);
     const entryHigh = +(price * (1 + vol * 0.3)).toFixed(2);
 
-    // Target: min +3%, max +6%, scaled by RSI
     const targetMultiplier = rsi < 40 ? 1.5 : rsi < 55 ? 1.2 : 1.0;
-    const rawTarget = price * (1 + vol * targetMultiplier);
-    const cappedTarget = Math.min(rawTarget, price * 1.06); // never more than +6%
-    const flooredTarget = Math.max(cappedTarget, price * 1.03); // never less than +3%
+    const rawTarget    = price * (1 + vol * targetMultiplier);
+    const cappedTarget = Math.min(rawTarget, price * 1.06);
+    const flooredTarget= Math.max(cappedTarget, price * 1.03);
     const target = +flooredTarget.toFixed(2);
 
-    // Stop: min -2%, max -4%
-    const rawStop = price * (1 - vol * 0.8);
-    const cappedStop = Math.max(rawStop, price * 0.96); // never wider than -4%
-    const flooredStop = Math.min(cappedStop, price * 0.98); // never tighter than -2%
+    const rawStop    = price * (1 - vol * 0.8);
+    const cappedStop = Math.max(rawStop, price * 0.96);
+    const flooredStop= Math.min(cappedStop, price * 0.98);
     const stop = +flooredStop.toFixed(2);
 
-    // Skip trade if risk/reward below 1.5 — not worth taking
     const upside   = (target - price) / price;
     const downside = (price - stop)   / price;
-    if (upside / downside < 1.5) {
-      console.log(`Skipped ${stock.ticker} — poor risk/reward ${(upside/downside).toFixed(1)}:1`);
+    const rr = upside / downside;
+
+    if (rr < 1.5) {
+      console.log(`${stock.ticker}: SKIPPED — poor R/R ${rr.toFixed(2)}`);
       continue;
     }
 
@@ -499,11 +499,11 @@ async function buildDailyRecommendations() {
     if (rsi < 35) score += 40;
     else if (rsi < 45) score += 25;
     else if (rsi < 60) score += 10;
-
     score += Math.max(0, 15 - Math.abs(day.change_pct));
     score += vol > 0.02 ? 10 : 0;
-    score += (target - price) / price > 0.05 ? 15 : 5;
+    score += upside > 0.05 ? 15 : 5;
 
+    console.log(`${stock.ticker}: PASSED — score=${score} target=$${target} stop=$${stop} R/R=${rr.toFixed(2)}`);
     candidates.push({
       ticker: stock.ticker, name: stock.name, price, rsi, vol,
       entryLow, entryHigh, target, stop, score,
