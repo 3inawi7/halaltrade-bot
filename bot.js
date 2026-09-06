@@ -314,42 +314,47 @@ async function sendTelegram(message) {
 
 // ── Alpaca data fetchers — real-time, free ──────────────────
 
-// Get latest bar (real-time price + OHLCV) from Alpaca
+// Get latest bar from Alpaca — tries multiple feeds for reliability
 async function getPrevDay(ticker) {
-  try {
-    // Latest trade gives real-time price
-    const latestUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars/latest?feed=iex`;
-    const latestRes  = await fetch(latestUrl, { headers: ALPACA_HEADERS });
-    const latestData = await latestRes.json();
+  // Try feeds in order: sip (most complete), iex (free real-time), delayed
+  const feeds = ['sip', 'iex'];
+  for (const feed of feeds) {
+    try {
+      // Try latest bar first
+      const latestUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars/latest?feed=${feed}`;
+      const latestRes  = await fetch(latestUrl, { headers: ALPACA_HEADERS });
+      const latestData = await latestRes.json();
+      if (latestData.bar) {
+        const b = latestData.bar;
+        return {
+          price:      b.c,
+          open:       b.o,
+          high:       b.h,
+          low:        b.l,
+          volume:     b.v,
+          change_pct: (((b.c - b.o) / b.o) * 100)
+        };
+      }
+    } catch (e) {}
 
-    if (latestData.bar) {
-      const b = latestData.bar;
-      return {
-        price:      b.c,
-        open:       b.o,
-        high:       b.h,
-        low:        b.l,
-        volume:     b.v,
-        change_pct: (((b.c - b.o) / b.o) * 100)
-      };
-    }
-
-    // Fallback: previous day bar
-    const prevUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=2&feed=iex`;
-    const prevRes  = await fetch(prevUrl, { headers: ALPACA_HEADERS });
-    const prevData = await prevRes.json();
-    if (prevData.bars?.length) {
-      const b = prevData.bars[prevData.bars.length - 1];
-      return {
-        price:      b.c,
-        open:       b.o,
-        high:       b.h,
-        low:        b.l,
-        volume:     b.v,
-        change_pct: (((b.c - b.o) / b.o) * 100)
-      };
-    }
-  } catch (e) { console.error(`getPrevDay error ${ticker}:`, e.message); }
+    try {
+      // Fallback: last 5 daily bars (works on weekends — returns last trading day)
+      const barsUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=5&feed=${feed}`;
+      const barsRes  = await fetch(barsUrl, { headers: ALPACA_HEADERS });
+      const barsData = await barsRes.json();
+      if (barsData.bars?.length) {
+        const b = barsData.bars[barsData.bars.length - 1];
+        return {
+          price:      b.c,
+          open:       b.o,
+          high:       b.h,
+          low:        b.l,
+          volume:     b.v,
+          change_pct: (((b.c - b.o) / b.o) * 100)
+        };
+      }
+    } catch (e) { console.error(`getPrevDay ${feed} error ${ticker}:`, e.message); }
+  }
   return null;
 }
 
@@ -367,52 +372,79 @@ async function getIntradayRange(ticker) {
   return null;
 }
 
-// Calculate real-time RSI from Alpaca 15-minute bars (last 14 periods)
-// This is INTRADAY RSI — not yesterday's close. Much more accurate.
+// Calculate RSI — uses 15-min bars during market hours, daily bars otherwise
 async function getRSI(ticker) {
-  try {
-    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=15Min&limit=28&feed=iex`;
-    const res  = await fetch(url, { headers: ALPACA_HEADERS });
-    const data = await res.json();
-    if (!data.bars || data.bars.length < 15) return null;
+  // Try intraday 15-min first (market hours only)
+  const feeds = ['sip', 'iex'];
+  for (const feed of feeds) {
+    try {
+      const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=15Min&limit=28&feed=${feed}`;
+      const res  = await fetch(url, { headers: ALPACA_HEADERS });
+      const data = await res.json();
+      if (data.bars?.length >= 15) {
+        const closes = data.bars.map(b => b.c);
+        let gains = 0, losses = 0;
+        for (let i = 1; i <= 14; i++) {
+          const diff = closes[i] - closes[i - 1];
+          if (diff > 0) gains  += diff;
+          else          losses -= diff;
+        }
+        let avgGain = gains / 14;
+        let avgLoss = losses / 14;
+        for (let i = 15; i < closes.length; i++) {
+          const diff = closes[i] - closes[i - 1];
+          avgGain = (avgGain * 13 + Math.max(diff, 0))  / 14;
+          avgLoss = (avgLoss * 13 + Math.max(-diff, 0)) / 14;
+        }
+        if (avgLoss === 0) return 100;
+        return 100 - (100 / (1 + avgGain / avgLoss));
+      }
+    } catch (e) {}
+  }
 
-    const closes = data.bars.map(b => b.c);
-    // Calculate RSI using standard Wilder smoothing
-    let gains = 0, losses = 0;
-    for (let i = 1; i <= 14; i++) {
-      const diff = closes[i] - closes[i - 1];
-      if (diff > 0) gains  += diff;
-      else          losses -= diff;
-    }
-    let avgGain = gains  / 14;
-    let avgLoss = losses / 14;
-
-    // Smooth remaining periods
-    for (let i = 15; i < closes.length; i++) {
-      const diff = closes[i] - closes[i - 1];
-      avgGain = (avgGain * 13 + Math.max(diff, 0)) / 14;
-      avgLoss = (avgLoss * 13 + Math.max(-diff, 0)) / 14;
-    }
-
-    if (avgLoss === 0) return 100;
-    const rs  = avgGain / avgLoss;
-    const rsi = 100 - (100 / (1 + rs));
-    return rsi;
-  } catch (e) { console.error(`getRSI error ${ticker}:`, e.message); }
+  // Fallback: daily RSI from last 20 daily bars (works on weekends)
+  for (const feed of feeds) {
+    try {
+      const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=20&feed=${feed}`;
+      const res  = await fetch(url, { headers: ALPACA_HEADERS });
+      const data = await res.json();
+      if (data.bars?.length >= 15) {
+        const closes = data.bars.map(b => b.c);
+        let gains = 0, losses = 0;
+        for (let i = 1; i <= 14; i++) {
+          const diff = closes[i] - closes[i - 1];
+          if (diff > 0) gains  += diff;
+          else          losses -= diff;
+        }
+        let avgGain = gains / 14;
+        let avgLoss = losses / 14;
+        for (let i = 15; i < closes.length; i++) {
+          const diff = closes[i] - closes[i - 1];
+          avgGain = (avgGain * 13 + Math.max(diff, 0))  / 14;
+          avgLoss = (avgLoss * 13 + Math.max(-diff, 0)) / 14;
+        }
+        if (avgLoss === 0) return 100;
+        return 100 - (100 / (1 + avgGain / avgLoss));
+      }
+    } catch (e) { console.error(`getRSI ${feed} error ${ticker}:`, e.message); }
+  }
   return null;
 }
 
 // Calculate 20-day average volatility from Alpaca daily bars
 async function getVolatility(ticker) {
-  try {
-    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=22&feed=iex`;
-    const res  = await fetch(url, { headers: ALPACA_HEADERS });
-    const data = await res.json();
-    if (data.bars?.length >= 5) {
-      const ranges = data.bars.map(b => (b.h - b.l) / b.c);
-      return ranges.reduce((a, b) => a + b, 0) / ranges.length;
-    }
-  } catch (e) {}
+  const feeds = ['sip', 'iex'];
+  for (const feed of feeds) {
+    try {
+      const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=22&feed=${feed}`;
+      const res  = await fetch(url, { headers: ALPACA_HEADERS });
+      const data = await res.json();
+      if (data.bars?.length >= 5) {
+        const ranges = data.bars.map(b => (b.h - b.l) / b.c);
+        return ranges.reduce((a, b) => a + b, 0) / ranges.length;
+      }
+    } catch (e) {}
+  }
   return 0.02; // fallback 2%
 }
 
@@ -552,7 +584,7 @@ async function sendDailyBriefing() {
   alertsSentToday.clear();
 
   if (todaysPicks.length === 0) {
-    await sendTelegram(`⚠️ <b>HalalTrade</b>\nCouldn't fetch live data today — check Polygon API key/limits. No picks generated for ${today}.`);
+    await sendTelegram(`⚠️ <b>HalalTrade</b>\nCouldn't fetch live data today — check Alpaca API keys in Railway variables. No picks generated for ${today}.`);
     return;
   }
 
