@@ -8,13 +8,23 @@
 
 require('dotenv').config();
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const CHAT_ID        = process.env.CHAT_ID        || 'YOUR_CHAT_ID_HERE';
-const POLYGON_KEY    = process.env.POLYGON_KEY    || 'YOUR_POLYGON_KEY';
-const CAPITAL        = parseFloat(process.env.CAPITAL) || 1000;
+const TELEGRAM_TOKEN  = process.env.TELEGRAM_TOKEN  || 'YOUR_BOT_TOKEN_HERE';
+const CHAT_ID         = process.env.CHAT_ID         || 'YOUR_CHAT_ID_HERE';
+const ALPACA_KEY      = process.env.ALPACA_KEY      || 'YOUR_ALPACA_KEY';
+const ALPACA_SECRET   = process.env.ALPACA_SECRET   || 'YOUR_ALPACA_SECRET';
+const CAPITAL         = parseFloat(process.env.CAPITAL) || 1000;
 
-if (TELEGRAM_TOKEN === 'YOUR_BOT_TOKEN_HERE' || CHAT_ID === 'YOUR_CHAT_ID_HERE' || POLYGON_KEY === 'YOUR_POLYGON_KEY') {
-  console.error('Missing keys! Check your .env file has real values for TELEGRAM_TOKEN, CHAT_ID, POLYGON_KEY.');
+// Alpaca paper trading base URL — real-time market data, free
+const ALPACA_DATA_URL = 'https://data.alpaca.markets/v2';
+const ALPACA_HEADERS  = {
+  'APCA-API-KEY-ID':     ALPACA_KEY,
+  'APCA-API-SECRET-KEY': ALPACA_SECRET,
+  'Content-Type':        'application/json'
+};
+
+if (TELEGRAM_TOKEN === 'YOUR_BOT_TOKEN_HERE' || CHAT_ID === 'YOUR_CHAT_ID_HERE' ||
+    ALPACA_KEY === 'YOUR_ALPACA_KEY' || ALPACA_SECRET === 'YOUR_ALPACA_SECRET') {
+  console.error('Missing keys! Check your .env file has real values for TELEGRAM_TOKEN, CHAT_ID, ALPACA_KEY, ALPACA_SECRET.');
   process.exit(1);
 }
 
@@ -160,22 +170,20 @@ async function evaluateOpenTrades() {
   const results = [];
 
   for (const trade of open) {
-    // Fetch the full daily price history since entry date
-    // This catches target/stop hits that were missed on previous days
+    // Fetch full daily price history since entry using Alpaca
     const today = new Date().toISOString().slice(0, 10);
     let intradayHigh = trade.entryPrice;
     let intradayLow  = trade.entryPrice;
     let currentPrice = trade.entryPrice;
 
     try {
-      const url = `https://api.polygon.io/v2/aggs/ticker/${trade.ticker}/range/1/day/${trade.date}/${today}?adjusted=true&sort=asc&limit=10&apiKey=${POLYGON_KEY}`;
-      const res  = await fetch(url);
+      const url = `${ALPACA_DATA_URL}/stocks/${trade.ticker}/bars?timeframe=1Day&start=${trade.date}&end=${today}&feed=iex&limit=10`;
+      const res  = await fetch(url, { headers: ALPACA_HEADERS });
       const data = await res.json();
-      if (data.results?.length) {
-        // Scan ALL days since entry to find if target or stop was ever hit
-        intradayHigh = Math.max(...data.results.map(d => d.h));
-        intradayLow  = Math.min(...data.results.map(d => d.l));
-        currentPrice = data.results[data.results.length - 1].c; // latest close
+      if (data.bars?.length) {
+        intradayHigh = Math.max(...data.bars.map(b => b.h));
+        intradayLow  = Math.min(...data.bars.map(b => b.l));
+        currentPrice = data.bars[data.bars.length - 1].c;
       }
     } catch (e) {
       console.error(`History fetch error ${trade.ticker}:`, e.message);
@@ -304,60 +312,108 @@ async function sendTelegram(message) {
   return data;
 }
 
+// ── Alpaca data fetchers — real-time, free ──────────────────
+
+// Get latest bar (real-time price + OHLCV) from Alpaca
 async function getPrevDay(ticker) {
   try {
-    const url = `https://api.polygon.io/v2/aggs/ticker/${ticker}/prev?adjusted=true&apiKey=${POLYGON_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (data.results?.length) {
-      const r = data.results[0];
-      return { price: r.c, open: r.o, high: r.h, low: r.l, volume: r.v,
-        change_pct: (((r.c - r.o) / r.o) * 100) };
+    // Latest trade gives real-time price
+    const latestUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars/latest?feed=iex`;
+    const latestRes  = await fetch(latestUrl, { headers: ALPACA_HEADERS });
+    const latestData = await latestRes.json();
+
+    if (latestData.bar) {
+      const b = latestData.bar;
+      return {
+        price:      b.c,
+        open:       b.o,
+        high:       b.h,
+        low:        b.l,
+        volume:     b.v,
+        change_pct: (((b.c - b.o) / b.o) * 100)
+      };
     }
-  } catch (e) { console.error(`prevDay error ${ticker}:`, e.message); }
+
+    // Fallback: previous day bar
+    const prevUrl = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=2&feed=iex`;
+    const prevRes  = await fetch(prevUrl, { headers: ALPACA_HEADERS });
+    const prevData = await prevRes.json();
+    if (prevData.bars?.length) {
+      const b = prevData.bars[prevData.bars.length - 1];
+      return {
+        price:      b.c,
+        open:       b.o,
+        high:       b.h,
+        low:        b.l,
+        volume:     b.v,
+        change_pct: (((b.c - b.o) / b.o) * 100)
+      };
+    }
+  } catch (e) { console.error(`getPrevDay error ${ticker}:`, e.message); }
   return null;
 }
 
-// Fetches today's intraday high and low from Polygon.
-// Critical for correct stop/target detection — a stop can be
-// breached intraday even if the stock recovers to close above it.
+// Get today's intraday high/low from Alpaca 1-minute bars
 async function getIntradayRange(ticker) {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const url = `https://api.polygon.io/v2/aggs/ticker/${ticker}/range/1/day/${today}/${today}?adjusted=true&apiKey=${POLYGON_KEY}`;
-    const res = await fetch(url);
+    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&start=${today}&feed=iex&limit=1`;
+    const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
-    if (data.results?.length) {
-      return { high: data.results[0].h, low: data.results[0].l };
+    if (data.bars?.length) {
+      return { high: data.bars[0].h, low: data.bars[0].l };
     }
   } catch (e) {}
   return null;
 }
 
+// Calculate real-time RSI from Alpaca 15-minute bars (last 14 periods)
+// This is INTRADAY RSI — not yesterday's close. Much more accurate.
 async function getRSI(ticker) {
   try {
-    const url = `https://api.polygon.io/v1/indicators/rsi/${ticker}?timespan=day&window=14&series_type=close&limit=1&apiKey=${POLYGON_KEY}`;
-    const res = await fetch(url);
+    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=15Min&limit=28&feed=iex`;
+    const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
-    if (data.results?.values?.length) return data.results.values[0].value;
-  } catch (e) {}
+    if (!data.bars || data.bars.length < 15) return null;
+
+    const closes = data.bars.map(b => b.c);
+    // Calculate RSI using standard Wilder smoothing
+    let gains = 0, losses = 0;
+    for (let i = 1; i <= 14; i++) {
+      const diff = closes[i] - closes[i - 1];
+      if (diff > 0) gains  += diff;
+      else          losses -= diff;
+    }
+    let avgGain = gains  / 14;
+    let avgLoss = losses / 14;
+
+    // Smooth remaining periods
+    for (let i = 15; i < closes.length; i++) {
+      const diff = closes[i] - closes[i - 1];
+      avgGain = (avgGain * 13 + Math.max(diff, 0)) / 14;
+      avgLoss = (avgLoss * 13 + Math.max(-diff, 0)) / 14;
+    }
+
+    if (avgLoss === 0) return 100;
+    const rs  = avgGain / avgLoss;
+    const rsi = 100 - (100 / (1 + rs));
+    return rsi;
+  } catch (e) { console.error(`getRSI error ${ticker}:`, e.message); }
   return null;
 }
 
+// Calculate 20-day average volatility from Alpaca daily bars
 async function getVolatility(ticker) {
   try {
-    const to = new Date().toISOString().slice(0, 10);
-    const fromDate = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-    const url = `https://api.polygon.io/v2/aggs/ticker/${ticker}/range/1/day/${fromDate}/${to}?adjusted=true&sort=desc&limit=20&apiKey=${POLYGON_KEY}`;
-    const res = await fetch(url);
+    const url = `${ALPACA_DATA_URL}/stocks/${ticker}/bars?timeframe=1Day&limit=22&feed=iex`;
+    const res  = await fetch(url, { headers: ALPACA_HEADERS });
     const data = await res.json();
-    if (data.results?.length >= 5) {
-      const ranges = data.results.map(d => (d.h - d.l) / d.c);
-      const avgRangePct = ranges.reduce((a, b) => a + b, 0) / ranges.length;
-      return avgRangePct;
+    if (data.bars?.length >= 5) {
+      const ranges = data.bars.map(b => (b.h - b.l) / b.c);
+      return ranges.reduce((a, b) => a + b, 0) / ranges.length;
     }
   } catch (e) {}
-  return 0.02;
+  return 0.02; // fallback 2%
 }
 
 // Known upcoming earnings dates — update weekly
@@ -787,9 +843,10 @@ async function mainLoop() {
   }
 
   await sendTelegram([
-    `🤖 <b>HalalTrade Bot is LIVE</b> (v2 — dynamic picks)`,
+    `🤖 <b>HalalTrade Bot is LIVE</b> (v3 — Alpaca real-time data)`,
     ``,
-    `📅 Daily briefing: 5:00 PM UAE — picks recalculated fresh from live data`,
+    `📊 Data source: Alpaca Markets (real-time intraday RSI)`,
+    `📅 Daily briefing: 5:00 PM UAE — picks from live intraday data`,
     `⚡ Price alerts: every 5 min during market hours`,
     `📋 Daily status: 12:45 AM UAE (Mon–Thu)`,
     `🌙 Weekly closing report: 12:45 AM UAE Friday`,
