@@ -473,6 +473,12 @@ async function buildDailyRecommendations() {
       continue;
     }
 
+    // Skip if RSI above 58 AND stock already up more than 1.5% today — chasing a move
+    if (rsi > 58 && day.change_pct > 1.5) {
+      console.log(`${stock.ticker}: SKIPPED — RSI ${rsi.toFixed(0)} + already up ${day.change_pct.toFixed(1)}% today`);
+      continue;
+    }
+
     if (isNearEarnings(stock.ticker)) {
       console.log(`${stock.ticker}: SKIPPED — near earnings`);
       continue;
