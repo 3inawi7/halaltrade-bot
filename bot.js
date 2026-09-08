@@ -706,6 +706,25 @@ async function sendEODSummary() {
   console.log(`[${new Date().toISOString()}] EOD summary sent`);
 }
 
+// US market holidays 2026 — market closed these days
+const US_HOLIDAYS_2026 = [
+  '2026-01-01', // New Year's Day
+  '2026-01-19', // MLK Day
+  '2026-02-16', // Presidents Day
+  '2026-04-03', // Good Friday
+  '2026-05-25', // Memorial Day
+  '2026-07-03', // Independence Day (observed)
+  '2026-09-07', // Labor Day
+  '2026-11-26', // Thanksgiving
+  '2026-11-27', // Day after Thanksgiving (early close)
+  '2026-12-25', // Christmas
+];
+
+function isUSMarketHoliday() {
+  const usDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  return US_HOLIDAYS_2026.includes(usDate);
+}
+
 function isWeekend() {
   // Get day-of-week in UAE time, then check what US market day that corresponds to.
   // Simplify: check the US/Eastern day-of-week directly, since that's what matters for NYSE/NASDAQ.
@@ -897,7 +916,7 @@ async function mainLoop() {
     lastMinute = minute;
 
     try {
-      if (isWeekend()) return; // markets closed Sat/Sun — skip all messages
+      if (isWeekend() || isUSMarketHoliday()) return; // markets closed
       if (hour === 17 && minute === 0)  await sendDailyBriefing();
       if (hour === 0  && minute === 30) await sendEODSummary();
 
