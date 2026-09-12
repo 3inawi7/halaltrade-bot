@@ -14,11 +14,23 @@ const ALPACA_KEY      = process.env.ALPACA_KEY      || 'YOUR_ALPACA_KEY';
 const ALPACA_SECRET   = process.env.ALPACA_SECRET   || 'YOUR_ALPACA_SECRET';
 const CAPITAL         = parseFloat(process.env.CAPITAL) || 1000;
 
+// Live trading keys — separate from paper/data keys
+const ALPACA_LIVE_KEY    = process.env.ALPACA_LIVE_KEY    || '';
+const ALPACA_LIVE_SECRET = process.env.ALPACA_LIVE_SECRET || '';
+const LIVE_CAPITAL       = parseFloat(process.env.LIVE_CAPITAL) || 200;
+const LIVE_TRADING       = ALPACA_LIVE_KEY !== '' && ALPACA_LIVE_SECRET !== '';
+
 // Alpaca paper trading base URL — real-time market data, free
-const ALPACA_DATA_URL = 'https://data.alpaca.markets/v2';
-const ALPACA_HEADERS  = {
+const ALPACA_DATA_URL  = 'https://data.alpaca.markets/v2';
+const ALPACA_TRADE_URL = 'https://api.alpaca.markets/v2'; // live trading endpoint
+const ALPACA_HEADERS   = {
   'APCA-API-KEY-ID':     ALPACA_KEY,
   'APCA-API-SECRET-KEY': ALPACA_SECRET,
+  'Content-Type':        'application/json'
+};
+const ALPACA_LIVE_HEADERS = {
+  'APCA-API-KEY-ID':     ALPACA_LIVE_KEY,
+  'APCA-API-SECRET-KEY': ALPACA_LIVE_SECRET,
   'Content-Type':        'application/json'
 };
 
@@ -27,6 +39,12 @@ if (TELEGRAM_TOKEN === 'YOUR_BOT_TOKEN_HERE' || CHAT_ID === 'YOUR_CHAT_ID_HERE' 
   console.error('Missing keys! Check your .env file has real values for TELEGRAM_TOKEN, CHAT_ID, ALPACA_KEY, ALPACA_SECRET.');
   process.exit(1);
 }
+
+console.log(`Live trading: ${LIVE_TRADING ? '✅ ENABLED ($' + LIVE_CAPITAL + ')' : '❌ DISABLED (paper only)'}`);
+
+// ── Pending order confirmations ─────────────────────────────
+// Stores trades waiting for /confirm before execution
+const pendingOrders = new Map();
 
 // Halal universe - Zoya/Musaffa zero-tolerance verified July 2026
 // Criteria: 0% interest income, 0% haram revenue, debt/assets <20%
@@ -315,6 +333,134 @@ async function sendTelegram(message) {
   const data = await res.json();
   if (!data.ok) console.error('Telegram error:', JSON.stringify(data));
   return data;
+}
+
+// ── Live order execution (Alpaca live account) ──────────────
+
+// Get live account balance
+async function getLiveBalance() {
+  try {
+    const res  = await fetch(`${ALPACA_TRADE_URL}/account`, { headers: ALPACA_LIVE_HEADERS });
+    const data = await res.json();
+    return parseFloat(data.buying_power) || 0;
+  } catch (e) { console.error('getLiveBalance error:', e.message); }
+  return 0;
+}
+
+// Place a limit buy order on Alpaca live account
+async function placeLiveBuyOrder(ticker, shares, limitPrice) {
+  try {
+    const order = {
+      symbol:        ticker,
+      qty:           shares.toFixed(2),
+      side:          'buy',
+      type:          'limit',
+      limit_price:   limitPrice.toFixed(2),
+      time_in_force: 'day',
+      extended_hours: false
+    };
+    const res  = await fetch(`${ALPACA_TRADE_URL}/orders`, {
+      method: 'POST',
+      headers: ALPACA_LIVE_HEADERS,
+      body: JSON.stringify(order)
+    });
+    const data = await res.json();
+    if (data.id) {
+      console.log(`Order placed: ${ticker} x${shares} @ $${limitPrice} — ID: ${data.id}`);
+      return { success: true, orderId: data.id, status: data.status };
+    }
+    console.error('Order failed:', JSON.stringify(data));
+    return { success: false, error: JSON.stringify(data) };
+  } catch (e) {
+    console.error('placeLiveBuyOrder error:', e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+// Place a stop-loss order on Alpaca live account
+async function placeStopLoss(ticker, shares, stopPrice) {
+  try {
+    const order = {
+      symbol:        ticker,
+      qty:           shares.toFixed(2),
+      side:          'sell',
+      type:          'stop',
+      stop_price:    stopPrice.toFixed(2),
+      time_in_force: 'gtc' // Good Till Cancelled
+    };
+    const res  = await fetch(`${ALPACA_TRADE_URL}/orders`, {
+      method: 'POST',
+      headers: ALPACA_LIVE_HEADERS,
+      body: JSON.stringify(order)
+    });
+    const data = await res.json();
+    return data.id ? { success: true, orderId: data.id } : { success: false, error: JSON.stringify(data) };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+// Place a take-profit limit sell order
+async function placeTakeProfit(ticker, shares, targetPrice) {
+  try {
+    const order = {
+      symbol:        ticker,
+      qty:           shares.toFixed(2),
+      side:          'sell',
+      type:          'limit',
+      limit_price:   targetPrice.toFixed(2),
+      time_in_force: 'gtc'
+    };
+    const res  = await fetch(`${ALPACA_TRADE_URL}/orders`, {
+      method: 'POST',
+      headers: ALPACA_LIVE_HEADERS,
+      body: JSON.stringify(order)
+    });
+    const data = await res.json();
+    return data.id ? { success: true, orderId: data.id } : { success: false, error: JSON.stringify(data) };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
+// Execute a confirmed trade — buy + stop-loss + take-profit
+async function executeLiveTrade(pick, dollars) {
+  const shares    = parseFloat((dollars / pick.price).toFixed(2));
+  const balance   = await getLiveBalance();
+
+  if (balance < dollars) {
+    await sendTelegram(`⚠️ <b>Insufficient funds</b>\nAvailable: $${balance.toFixed(2)} | Required: $${dollars}\nDeposit more funds to Alpaca.`);
+    return;
+  }
+
+  // Place limit buy
+  const buyResult = await placeLiveBuyOrder(pick.ticker, shares, pick.entryHigh);
+  if (!buyResult.success) {
+    await sendTelegram(`❌ <b>Order failed — ${pick.ticker}</b>\n${buyResult.error}`);
+    return;
+  }
+
+  // Wait 2 seconds then place stop-loss and take-profit
+  await new Promise(r => setTimeout(r, 2000));
+  const stopResult   = await placeStopLoss(pick.ticker, shares, pick.stop);
+  const targetResult = await placeTakeProfit(pick.ticker, shares, pick.target);
+
+  const upside   = (((pick.target - pick.price) / pick.price) * 100).toFixed(1);
+  const downside = (((pick.price - pick.stop)   / pick.price) * 100).toFixed(1);
+
+  await sendTelegram([
+    `✅ <b>LIVE TRADE EXECUTED — ${pick.ticker}</b>`,
+    ``,
+    `💵 Buy order: ${shares} shares @ $${pick.entryHigh} (limit)`,
+    `🎯 Take-profit: $${pick.target} (+${upside}%)`,
+    `🛑 Stop-loss: $${pick.stop} (-${downside}%)`,
+    `💰 Capital: $${dollars}`,
+    ``,
+    `Buy order: ${buyResult.success ? '✅ Placed' : '❌ Failed'}`,
+    `Stop-loss: ${stopResult.success ? '✅ Placed' : '❌ Failed'}`,
+    `Take-profit: ${targetResult.success ? '✅ Placed' : '❌ Failed'}`,
+    ``,
+    `☽ Halal verified · Zero-tolerance`,
+    `📲 Monitor in Alpaca app or send /positions`
+  ].join('\n'));
+
+  console.log(`Live trade executed: ${pick.ticker} x${shares} @ $${pick.entryHigh}`);
 }
 
 // ── Data fetchers ───────────────────────────────────────────
@@ -614,6 +760,18 @@ async function sendDailyBriefing() {
     lines.push(`   └─────────────────────────`);
     lines.push(`   ⏰ Set stop-loss immediately after fill`);
     lines.push(``);
+
+    // If live trading enabled, queue a pending order and prompt for confirmation
+    if (LIVE_TRADING) {
+      const liveAlloc  = allocationFor(i);
+      const liveDollars = Math.round(LIVE_CAPITAL * liveAlloc);
+      const liveShares  = parseFloat((liveDollars / p.price).toFixed(2));
+      pendingOrders.set(p.ticker, { pick: p, dollars: liveDollars, shares: liveShares, limitPrice: p.entryHigh, stop: p.stop, target: p.target });
+      lines.push(`   💸 <b>LIVE TRADE READY — $${liveDollars} on Alpaca</b>`);
+      lines.push(`   Reply <code>/confirm ${p.ticker}</code> to execute automatically`);
+      lines.push(`   Reply <code>/cancel ${p.ticker}</code> to skip`);
+      lines.push(``);
+    }
   });
 
   lines.push(`<b>━━━ RULES ━━━</b>`);
@@ -779,7 +937,89 @@ async function pollTelegramCommands() {
 
       console.log(`[${new Date().toISOString()}] Command received: ${text}`);
 
-      if (text === '/today' || text === '/picks') {
+      // Live trading commands
+      if (text === '/balance') {
+        if (!LIVE_TRADING) { await sendTelegram('⚠️ Live trading not enabled. Add ALPACA_LIVE_KEY and ALPACA_LIVE_SECRET to Railway variables.'); }
+        else {
+          const bal = await getLiveBalance();
+          await sendTelegram(`💰 <b>Alpaca Live Balance</b>\n\nBuying power: <b>$${bal.toFixed(2)}</b>\nLive capital target: $${LIVE_CAPITAL}`);
+        }
+      } else if (text === '/positions') {
+        if (!LIVE_TRADING) { await sendTelegram('⚠️ Live trading not enabled.'); }
+        else {
+          try {
+            const res  = await fetch(`${ALPACA_TRADE_URL}/positions`, { headers: ALPACA_LIVE_HEADERS });
+            const data = await res.json();
+            if (!data.length) { await sendTelegram('📊 No open positions in Alpaca live account.'); }
+            else {
+              const lines = [`📊 <b>Live Positions</b>`, ``];
+              data.forEach(p => {
+                const pl    = parseFloat(p.unrealized_pl);
+                const plpct = parseFloat(p.unrealized_plpc) * 100;
+                lines.push(`<b>${p.symbol}</b>: ${p.qty} shares @ $${parseFloat(p.avg_entry_price).toFixed(2)}`);
+                lines.push(`   Current: $${parseFloat(p.current_price).toFixed(2)} | P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plpct >= 0 ? '+' : ''}${plpct.toFixed(1)}%)`);
+                lines.push(``);
+              });
+              await sendTelegram(lines.join('\n'));
+            }
+          } catch (e) { await sendTelegram(`❌ Error fetching positions: ${e.message}`); }
+        }
+      } else if (text === '/orders') {
+        if (!LIVE_TRADING) { await sendTelegram('⚠️ Live trading not enabled.'); }
+        else {
+          try {
+            const res  = await fetch(`${ALPACA_TRADE_URL}/orders?status=open`, { headers: ALPACA_LIVE_HEADERS });
+            const data = await res.json();
+            if (!data.length) { await sendTelegram('📋 No open orders in Alpaca live account.'); }
+            else {
+              const lines = [`📋 <b>Open Orders</b>`, ``];
+              data.forEach(o => {
+                lines.push(`<b>${o.symbol}</b>: ${o.side.toUpperCase()} ${o.qty} @ $${o.limit_price || o.stop_price || 'market'} (${o.type})`);
+                lines.push(`   Status: ${o.status} | ID: ${o.id.slice(0,8)}...`);
+              });
+              await sendTelegram(lines.join('\n'));
+            }
+          } catch (e) { await sendTelegram(`❌ Error fetching orders: ${e.message}`); }
+        }
+      } else if (text.startsWith('/confirm')) {
+        // /confirm AMD or /confirm (confirms the pending order for that ticker)
+        const ticker = text.split(' ')[1]?.toUpperCase();
+        if (!ticker) {
+          // Show all pending orders
+          if (pendingOrders.size === 0) { await sendTelegram('No pending orders to confirm.'); }
+          else {
+            const lines = [`⏳ <b>Pending Orders — reply /confirm TICKER to execute</b>`, ``];
+            pendingOrders.forEach((order, t) => {
+              lines.push(`/confirm ${t} — ${t} x${order.shares} @ $${order.limitPrice} | Stop: $${order.stop} | Target: $${order.target}`);
+            });
+            await sendTelegram(lines.join('\n'));
+          }
+        } else if (pendingOrders.has(ticker)) {
+          const order = pendingOrders.get(ticker);
+          pendingOrders.delete(ticker);
+          await sendTelegram(`🔄 Executing live trade for ${ticker}...`);
+          await executeLiveTrade(order.pick, order.dollars);
+        } else {
+          await sendTelegram(`No pending order found for ${ticker}. Send /today to generate fresh picks.`);
+        }
+      } else if (text.startsWith('/cancel')) {
+        const ticker = text.split(' ')[1]?.toUpperCase();
+        if (ticker && pendingOrders.has(ticker)) {
+          pendingOrders.delete(ticker);
+          await sendTelegram(`❌ Order cancelled for ${ticker}.`);
+        } else {
+          pendingOrders.clear();
+          await sendTelegram(`❌ All pending orders cancelled.`);
+        }
+      } else if (text === '/closeall') {
+        if (!LIVE_TRADING) { await sendTelegram('⚠️ Live trading not enabled.'); }
+        else {
+          try {
+            await fetch(`${ALPACA_TRADE_URL}/positions`, { method: 'DELETE', headers: ALPACA_LIVE_HEADERS });
+            await sendTelegram(`🔴 <b>All positions closed</b>\nAll open positions have been liquidated at market price.`);
+          } catch (e) { await sendTelegram(`❌ Error closing positions: ${e.message}`); }
+        }
+      } else if (text === '/today' || text === '/picks') {
         if (isWeekend()) {
           await sendTelegram([
             `⚠️ <b>Markets are closed today (weekend)</b>`,
@@ -811,12 +1051,27 @@ async function pollTelegramCommands() {
         await sendTelegram([
           `🤖 <b>HalalTrade Bot Commands</b>`,
           ``,
+          `<b>— Picks & Reports —</b>`,
           `/today — Get fresh picks right now`,
           `/status — Check open paper trades`,
           `/weekly — Full weekly closing report`,
           `/earnings — Show upcoming earnings dates`,
-          `/cleardupes — Remove duplicate picks from log`,
+          `/recover — Restore known trades if log wiped`,
+          `/cleardupes — Remove duplicate picks`,
+          ``,
+          `<b>— Live Trading (Alpaca) —</b>`,
+          `/balance — Check Alpaca live account balance`,
+          `/positions — View open live positions`,
+          `/orders — View open live orders`,
+          `/confirm TICKER — Execute pending trade`,
+          `/cancel TICKER — Cancel pending trade`,
+          `/closeall — Close all live positions (emergency)`,
+          ``,
+          `<b>— Debug —</b>`,
+          `/debug — Test API connections`,
           `/help — Show this menu`,
+          ``,
+          `Live trading: ${LIVE_TRADING ? '✅ ENABLED ($' + LIVE_CAPITAL + ')' : '❌ DISABLED'}`,
           ``,
           `Scheduled automatically:`,
           `📅 5:00 PM UAE — daily briefing`,
