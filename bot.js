@@ -250,7 +250,7 @@ async function sendFridayClosingReport() {
   await evaluateOpenTrades(); // refresh prices and auto-close any that hit target/stop today
   const log = await loadLog();
 
-  const oneWeekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const oneWeekAgo = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
   const thisWeek = log.filter(t => t.date >= oneWeekAgo);
 
   if (thisWeek.length === 0) {
@@ -569,7 +569,7 @@ async function sendDailyBriefing() {
     return;
   }
 
-  logPicks(todaysPicks); // record for paper-trade tracking
+  await logPicks(todaysPicks); // record for paper-trade tracking — await is critical
 
   const lines = [
     `☽ <b>HalalTrade Daily Briefing</b>`,
@@ -844,6 +844,23 @@ async function pollTelegramCommands() {
           `Live fetch test:`,
           fetchTest
         ].join('\n'));
+      } else if (text === '/recover') {
+        // Manually restore this week's known trades when log gets wiped by deployment
+        const existing = await loadLog();
+        const knownTrades = [
+          { date:'2026-09-06', ticker:'AMD',  entryPrice:477.57, target:506.02, stop:458.47, rsi:48.7, closed:true,  result:'TARGET HIT ✅', closedPrice:508.79, closedPct:6.5,  closedDate:'2026-09-08' },
+          { date:'2026-09-07', ticker:'MRVL', entryPrice:223.41, target:235.27, stop:215.50, rsi:50.3, closed:true,  result:'TARGET HIT ✅', closedPrice:235.01, closedPct:5.2,  closedDate:'2026-09-10' },
+          { date:'2026-09-08', ticker:'NVDA', entryPrice:232.00, target:238.96, stop:227.36, rsi:61.2, closed:true,  result:'STOP HIT 🛑',   closedPrice:225.99, closedPct:-2.6, closedDate:'2026-09-08' },
+          { date:'2026-09-08', ticker:'TSM',  entryPrice:436.01, target:449.09, stop:427.29, rsi:55.3, closed:true,  result:'STOP HIT 🛑',   closedPrice:435.36, closedPct:-0.1, closedDate:'2026-09-10' },
+          { date:'2026-09-09', ticker:'NVDA', entryPrice:224.58, target:231.32, stop:220.09, rsi:52.0, closed:true,  result:'STOP HIT 🛑',   closedPrice:223.67, closedPct:-0.4, closedDate:'2026-09-10' },
+          { date:'2026-09-09', ticker:'AAPL', entryPrice:315.03, target:324.38, stop:308.73, rsi:48.0, closed:true,  result:'TARGET HIT ✅', closedPrice:315.34, closedPct:0.1,  closedDate:'2026-09-10' },
+        ];
+        // Only add trades not already in the log
+        const existingKeys = new Set(existing.map(t => `${t.date}-${t.ticker}`));
+        const toAdd = knownTrades.filter(t => !existingKeys.has(`${t.date}-${t.ticker}`));
+        const merged = [...existing, ...toAdd];
+        await saveLog(merged);
+        await sendTelegram(`✅ <b>Log recovered</b>\nRestored ${toAdd.length} trades (${knownTrades.length - toAdd.length} already existed).\nSend /weekly to see the full report.`);
       } else if (text === '/cleardupes') {
         const log = await loadLog();
         const seen = new Set();
