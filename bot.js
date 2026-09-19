@@ -119,31 +119,59 @@ async function loadLog() {
 
 async function saveLog(log) {
   try {
-    const text = 'HALALTRADE_LOG:' + JSON.stringify(log);
-    if (pinnedMessageId) {
-      // Edit the existing pinned message
-      await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, text })
-      });
-    } else {
-      // First time: send and pin a new log message
-      const sent = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: CHAT_ID, text, disable_notification: true })
-      }).then(r => r.json());
-      if (sent.ok) {
-        pinnedMessageId = sent.result.message_id;
-        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/pinChatMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, disable_notification: true })
-        });
+    // Compress old closed trades to save space — keep full data for last 30 days only
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    const compressed = log.map(t => {
+      if (t.closed && t.date < thirtyDaysAgo) {
+        // Keep minimal data for old closed trades
+        return { date: t.date, ticker: t.ticker, entryPrice: t.entryPrice,
+          target: t.target, stop: t.stop, closed: true, result: t.result,
+          closedPrice: t.closedPrice, closedPct: t.closedPct, closedDate: t.closedDate };
       }
+      return t;
+    });
+
+    const text = 'HALALTRADE_LOG:' + JSON.stringify(compressed);
+
+    // Check size — Telegram message limit is 4096 chars
+    if (text.length > 4000) {
+      // Further compress: only keep last 50 trades
+      const recent = compressed.slice(-50);
+      const textShort = 'HALALTRADE_LOG:' + JSON.stringify(recent);
+      console.log(`saveLog: log compressed from ${log.length} to ${recent.length} trades (size: ${textShort.length})`);
+      return await _saveToTelegram(textShort);
     }
+
+    return await _saveToTelegram(text);
   } catch (e) { console.error('saveLog error:', e.message); }
+}
+
+async function _saveToTelegram(text) {
+  if (pinnedMessageId) {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, text })
+    });
+    const data = await res.json();
+    if (!data.ok) console.error('saveLog editMessage error:', JSON.stringify(data));
+    return data;
+  } else {
+    const sent = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: CHAT_ID, text, disable_notification: true })
+    }).then(r => r.json());
+    if (sent.ok) {
+      pinnedMessageId = sent.result.message_id;
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/pinChatMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: CHAT_ID, message_id: pinnedMessageId, disable_notification: true })
+      });
+    }
+    return sent;
+  }
 }
 
 async function logPicks(picks) {
