@@ -150,6 +150,13 @@ async function logPicks(picks) {
   const log = await loadLog();
   const today = new Date().toISOString().slice(0, 10);
 
+  // Never log more than 3 open positions at once — prevents log explosion
+  const currentlyOpen = log.filter(t => !t.closed).length;
+  if (currentlyOpen >= 3) {
+    console.log(`logPicks: skipping — already ${currentlyOpen} open positions (max 3)`);
+    return;
+  }
+
   // Prevent duplicates — don't log the same ticker twice on the same day
   const alreadyLoggedToday = new Set(
     log.filter(t => t.date === today).map(t => t.ticker)
@@ -188,6 +195,8 @@ async function evaluateOpenTrades() {
   const results = [];
 
   for (const trade of open) {
+    await new Promise(r => setTimeout(r, 500)); // avoid Yahoo rate limiting with many trades
+
     // Fetch full price history since entry using Yahoo Finance
     const today = new Date().toISOString().slice(0, 10);
     let intradayHigh = trade.entryPrice;
@@ -1099,6 +1108,24 @@ async function pollTelegramCommands() {
           `Live fetch test:`,
           fetchTest
         ].join('\n'));
+      } else if (text === '/clearopen') {
+        await sendTelegram('🔄 Evaluating all open trades against current prices...');
+        const results = await evaluateOpenTrades();
+        const closed = results.filter(r => r.outcome !== 'OPEN ⏳');
+        const stillOpen = results.filter(r => r.outcome === 'OPEN ⏳');
+        const lines = [`📋 <b>Open Trades Evaluated</b>`, ``];
+        closed.forEach(r => {
+          lines.push(`${r.outcome === 'TARGET HIT ✅' ? '✅' : '🛑'} <b>${r.trade.ticker}</b> (${r.trade.date}): ${r.outcome} at $${r.currentPrice.toFixed(2)} (${r.pctMove >= 0 ? '+' : ''}${r.pctMove.toFixed(1)}%)`);
+        });
+        if (stillOpen.length) {
+          lines.push(``);
+          lines.push(`Still open (${stillOpen.length}):`);
+          stillOpen.forEach(r => {
+            lines.push(`⏳ <b>${r.trade.ticker}</b> (${r.trade.date}): $${r.currentPrice.toFixed(2)} (${r.pctMove >= 0 ? '+' : ''}${r.pctMove.toFixed(1)}%) | Target: $${r.trade.target} | Stop: $${r.trade.stop}`);
+          });
+        }
+        lines.push(`\n${closed.length} trades closed, ${stillOpen.length} still open.`);
+        await sendTelegram(lines.join('\n'));
       } else if (text === '/recover') {
         // Manually restore this week's known trades when log gets wiped by deployment
         const existing = await loadLog();
