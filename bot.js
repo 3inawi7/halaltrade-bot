@@ -233,14 +233,16 @@ async function evaluateOpenTrades() {
 
     try {
       const daysSinceEntry = Math.ceil((new Date(today) - new Date(trade.date)) / 86400000) + 5;
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${trade.ticker}?interval=1d&range=${daysSinceEntry}d`;
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${trade.ticker}?interval=1d&range=${daysSinceEntry}d&events=div%2Csplits&includeAdjustedClose=true`;
       const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       const data = await res.json();
       const result = data.chart?.result?.[0];
       if (result) {
-        const highs  = result.indicators.quote[0].high.filter(h => h);
-        const lows   = result.indicators.quote[0].low.filter(l => l);
-        const closes = result.indicators.quote[0].close.filter(c => c);
+        const adjclose = result.indicators?.adjclose?.[0]?.adjclose;
+        const quote    = result.indicators?.quote?.[0];
+        const closes   = (adjclose || quote?.close || []).filter(c => c);
+        const highs    = (quote?.high  || []).filter(h => h);
+        const lows     = (quote?.low   || []).filter(l => l);
         if (highs.length)  intradayHigh = Math.max(...highs);
         if (lows.length)   intradayLow  = Math.min(...lows);
         if (closes.length) currentPrice = closes[closes.length - 1];
@@ -456,12 +458,13 @@ async function placeTakeProfit(ticker, shares, targetPrice) {
   } catch (e) { return { success: false, error: e.message }; }
 }
 
-// Execute a confirmed trade using Alpaca bracket order
-// A bracket order places buy + stop-loss + take-profit atomically
-// This is the correct approach — no race condition between buy fill and stop placement
+// Execute a confirmed trade
+// Uses bracket order for whole shares, simple limit for fractional
 async function executeLiveTrade(pick, dollars) {
-  const shares  = parseFloat((dollars / pick.price).toFixed(2));
-  const balance = await getLiveBalance();
+  const sharesRaw = dollars / pick.price;
+  const isWhole   = sharesRaw >= 1;
+  const shares    = parseFloat((isWhole ? Math.floor(sharesRaw) : sharesRaw).toFixed(2));
+  const balance   = await getLiveBalance();
 
   if (balance < dollars) {
     await sendTelegram(`⚠️ <b>Insufficient funds</b>\nAvailable: $${balance.toFixed(2)} | Required: $${dollars}\nDeposit more funds to Alpaca.`);
@@ -472,22 +475,32 @@ async function executeLiveTrade(pick, dollars) {
   const downside = (((pick.price - pick.stop)   / pick.price) * 100).toFixed(1);
 
   try {
-    // Bracket order: buy limit + take-profit + stop-loss in one atomic order
-    const order = {
-      symbol:        pick.ticker,
-      qty:           shares.toFixed(2),
-      side:          'buy',
-      type:          'limit',
-      limit_price:   pick.entryHigh.toFixed(2),
-      time_in_force: 'day',
-      order_class:   'bracket',
-      take_profit: {
-        limit_price: pick.target.toFixed(2)
-      },
-      stop_loss: {
-        stop_price: pick.stop.toFixed(2)
-      }
-    };
+    let order;
+    if (isWhole && shares >= 1) {
+      // Bracket order for whole shares — fully automated stop + target
+      order = {
+        symbol:        pick.ticker,
+        qty:           shares.toString(),
+        side:          'buy',
+        type:          'limit',
+        limit_price:   pick.entryHigh.toFixed(2),
+        time_in_force: 'day',
+        order_class:   'bracket',
+        take_profit:   { limit_price: pick.target.toFixed(2) },
+        stop_loss:     { stop_price:  pick.stop.toFixed(2) }
+      };
+    } else {
+      // Simple limit order for fractional shares
+      // Stop-loss must be set manually in Alpaca app after fill
+      order = {
+        symbol:        pick.ticker,
+        qty:           shares.toFixed(4),
+        side:          'buy',
+        type:          'limit',
+        limit_price:   pick.entryHigh.toFixed(2),
+        time_in_force: 'day'
+      };
+    }
 
     const res  = await fetch(`${ALPACA_TRADE_URL}/orders`, {
       method: 'POST',
@@ -497,27 +510,28 @@ async function executeLiveTrade(pick, dollars) {
     const data = await res.json();
 
     if (data.id) {
+      const isAuto = isWhole && shares >= 1;
       await sendTelegram([
-        `✅ <b>LIVE BRACKET ORDER PLACED — ${pick.ticker}</b>`,
+        `✅ <b>LIVE ORDER PLACED — ${pick.ticker}</b>`,
         ``,
-        `💵 Buy limit: ${shares} shares @ $${pick.entryHigh}`,
-        `🎯 Take-profit: $${pick.target} (+${upside}%)`,
-        `🛑 Stop-loss: $${pick.stop} (-${downside}%)`,
+        `💵 Buy: ${shares} shares @ $${pick.entryHigh} (limit)`,
+        `🎯 Target: $${pick.target} (+${upside}%)`,
+        `🛑 Stop: $${pick.stop} (-${downside}%)`,
         `💰 Capital: $${dollars}`,
-        `📋 Order ID: ${data.id.slice(0, 8)}...`,
         ``,
-        `Stop-loss and take-profit activate automatically once buy fills.`,
+        isAuto
+          ? `🤖 Bracket order — stop & target set automatically`
+          : `⚠️ Fractional order — set stop-loss manually in Alpaca app at $${pick.stop}`,
+        ``,
         `☽ Halal verified · Zero-tolerance`,
-        `📲 Monitor with /positions or in Alpaca app`
+        `📲 Send /positions to monitor`
       ].join('\n'));
-      console.log(`Bracket order placed: ${pick.ticker} x${shares} @ $${pick.entryHigh} — ID: ${data.id}`);
+      console.log(`Order placed: ${pick.ticker} x${shares} @ $${pick.entryHigh} (${isAuto ? 'bracket' : 'simple'})`);
     } else {
       await sendTelegram(`❌ <b>Order failed — ${pick.ticker}</b>\n${JSON.stringify(data)}`);
-      console.error('Bracket order failed:', JSON.stringify(data));
     }
   } catch (e) {
     await sendTelegram(`❌ <b>Order error — ${pick.ticker}</b>\n${e.message}`);
-    console.error('executeLiveTrade error:', e.message);
   }
 }
 
@@ -559,14 +573,22 @@ async function getPrevDay(ticker) {
   return null;
 }
 
-// Fetch historical daily closes from Yahoo Finance — free, no API key, works on weekends
+// Fetch historical daily closes from Yahoo Finance — split-adjusted, free, works on weekends
 async function getYahooHistory(ticker, days = 30) {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=${Math.ceil(days * 1.5)}d`;
+    // Use events=splits to get split info and adjclose for split-adjusted prices
+    const range = Math.ceil(days * 1.5);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=${range}d&events=div%2Csplits&includeAdjustedClose=true`;
     const res  = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     const data = await res.json();
-    const closes = data.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
-    if (closes?.length) return closes.filter(c => c !== null && c !== undefined);
+    const result = data.chart?.result?.[0];
+    if (!result) return [];
+
+    // Use adjclose (split-adjusted) if available, fall back to close
+    const adjclose = result.indicators?.adjclose?.[0]?.adjclose;
+    const close    = result.indicators?.quote?.[0]?.close;
+    const prices   = adjclose || close;
+    if (prices?.length) return prices.filter(c => c !== null && c !== undefined);
   } catch (e) { console.error(`Yahoo history error ${ticker}:`, e.message); }
   return [];
 }
