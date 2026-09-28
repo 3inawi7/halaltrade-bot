@@ -456,48 +456,69 @@ async function placeTakeProfit(ticker, shares, targetPrice) {
   } catch (e) { return { success: false, error: e.message }; }
 }
 
-// Execute a confirmed trade — buy + stop-loss + take-profit
+// Execute a confirmed trade using Alpaca bracket order
+// A bracket order places buy + stop-loss + take-profit atomically
+// This is the correct approach — no race condition between buy fill and stop placement
 async function executeLiveTrade(pick, dollars) {
-  const shares    = parseFloat((dollars / pick.price).toFixed(2));
-  const balance   = await getLiveBalance();
+  const shares  = parseFloat((dollars / pick.price).toFixed(2));
+  const balance = await getLiveBalance();
 
   if (balance < dollars) {
     await sendTelegram(`⚠️ <b>Insufficient funds</b>\nAvailable: $${balance.toFixed(2)} | Required: $${dollars}\nDeposit more funds to Alpaca.`);
     return;
   }
 
-  // Place limit buy
-  const buyResult = await placeLiveBuyOrder(pick.ticker, shares, pick.entryHigh);
-  if (!buyResult.success) {
-    await sendTelegram(`❌ <b>Order failed — ${pick.ticker}</b>\n${buyResult.error}`);
-    return;
-  }
-
-  // Wait 2 seconds then place stop-loss and take-profit
-  await new Promise(r => setTimeout(r, 2000));
-  const stopResult   = await placeStopLoss(pick.ticker, shares, pick.stop);
-  const targetResult = await placeTakeProfit(pick.ticker, shares, pick.target);
-
   const upside   = (((pick.target - pick.price) / pick.price) * 100).toFixed(1);
   const downside = (((pick.price - pick.stop)   / pick.price) * 100).toFixed(1);
 
-  await sendTelegram([
-    `✅ <b>LIVE TRADE EXECUTED — ${pick.ticker}</b>`,
-    ``,
-    `💵 Buy order: ${shares} shares @ $${pick.entryHigh} (limit)`,
-    `🎯 Take-profit: $${pick.target} (+${upside}%)`,
-    `🛑 Stop-loss: $${pick.stop} (-${downside}%)`,
-    `💰 Capital: $${dollars}`,
-    ``,
-    `Buy order: ${buyResult.success ? '✅ Placed' : '❌ Failed'}`,
-    `Stop-loss: ${stopResult.success ? '✅ Placed' : '❌ Failed'}`,
-    `Take-profit: ${targetResult.success ? '✅ Placed' : '❌ Failed'}`,
-    ``,
-    `☽ Halal verified · Zero-tolerance`,
-    `📲 Monitor in Alpaca app or send /positions`
-  ].join('\n'));
+  try {
+    // Bracket order: buy limit + take-profit + stop-loss in one atomic order
+    const order = {
+      symbol:        pick.ticker,
+      qty:           shares.toFixed(2),
+      side:          'buy',
+      type:          'limit',
+      limit_price:   pick.entryHigh.toFixed(2),
+      time_in_force: 'day',
+      order_class:   'bracket',
+      take_profit: {
+        limit_price: pick.target.toFixed(2)
+      },
+      stop_loss: {
+        stop_price: pick.stop.toFixed(2)
+      }
+    };
 
-  console.log(`Live trade executed: ${pick.ticker} x${shares} @ $${pick.entryHigh}`);
+    const res  = await fetch(`${ALPACA_TRADE_URL}/orders`, {
+      method: 'POST',
+      headers: ALPACA_LIVE_HEADERS,
+      body: JSON.stringify(order)
+    });
+    const data = await res.json();
+
+    if (data.id) {
+      await sendTelegram([
+        `✅ <b>LIVE BRACKET ORDER PLACED — ${pick.ticker}</b>`,
+        ``,
+        `💵 Buy limit: ${shares} shares @ $${pick.entryHigh}`,
+        `🎯 Take-profit: $${pick.target} (+${upside}%)`,
+        `🛑 Stop-loss: $${pick.stop} (-${downside}%)`,
+        `💰 Capital: $${dollars}`,
+        `📋 Order ID: ${data.id.slice(0, 8)}...`,
+        ``,
+        `Stop-loss and take-profit activate automatically once buy fills.`,
+        `☽ Halal verified · Zero-tolerance`,
+        `📲 Monitor with /positions or in Alpaca app`
+      ].join('\n'));
+      console.log(`Bracket order placed: ${pick.ticker} x${shares} @ $${pick.entryHigh} — ID: ${data.id}`);
+    } else {
+      await sendTelegram(`❌ <b>Order failed — ${pick.ticker}</b>\n${JSON.stringify(data)}`);
+      console.error('Bracket order failed:', JSON.stringify(data));
+    }
+  } catch (e) {
+    await sendTelegram(`❌ <b>Order error — ${pick.ticker}</b>\n${e.message}`);
+    console.error('executeLiveTrade error:', e.message);
+  }
 }
 
 // ── Data fetchers ───────────────────────────────────────────
@@ -606,19 +627,18 @@ function calcRSI(closes) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-// Known upcoming earnings dates — update weekly
+// Known upcoming earnings dates — Q4 2026
 // Bot skips any stock within 5 trading days of its earnings report
-// This prevents the AAPL -7.2% earnings gap situation from repeating
 const EARNINGS_DATES = {
-  'AAPL': '2026-10-29', // next earnings after July 30 report
+  'AAPL': '2026-10-29',
   'AMD':  '2026-10-28',
-  'NVDA': '2026-08-27',
+  'NVDA': '2026-11-19',
   'GOOGL':'2026-10-28',
-  'QCOM': '2026-10-22',
-  'AVGO': '2026-09-11',
-  'TSM':  '2026-10-16',
-  'AMAT': '2026-08-14',
-  'MRVL': '2026-09-04',
+  'QCOM': '2026-10-28',
+  'AVGO': '2026-12-10',
+  'TSM':  '2026-10-15',
+  'AMAT': '2026-11-19',
+  'MRVL': '2026-12-03',
 };
 
 function isNearEarnings(ticker) {
